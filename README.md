@@ -1,5 +1,5 @@
 # Insignia
-
+#WARNING, THIS CURRENTLY GETS YOU KICKED FOR INVALID PACKETS, MAYBE ILL FIX IT IN THE FUTURE MAYBE I WONT!
 A Minecraft Fabric mod that enhances your Crystal PvP experience by categorizing players with custom tags and tracking their stats. Insignia adds colored tags to players in the tab menu and provides easy access to Crystal 1v1 statistics.
 
 ## Features
