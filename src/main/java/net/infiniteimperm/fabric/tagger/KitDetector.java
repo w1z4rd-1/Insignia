@@ -93,4 +93,4 @@ public class KitDetector {
         // Update the visual effects renderer
         KitEffectRenderer.tick();
     }
-} 
+}

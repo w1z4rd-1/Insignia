@@ -62,4 +62,4 @@ public class TotemWarningOverlay {
              drawContext.fill(0, 0, screenWidth, screenHeight, OVERLAY_COLOR);
         }
     }
-} 
+}

@@ -3,10 +3,10 @@
   "package": "net.infiniteimperm.fabric.tagger.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "PlayerEntityMixin",
+    "CommandInterceptorMixin",
     "TotemPopMixin"
   ],
   "injectors": {
     "defaultRequire": 1
   }
-} 
+}

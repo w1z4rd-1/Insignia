@@ -4,17 +4,18 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LightningEntity;
 import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.particle.ParticleTypes;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.math.MathHelper;
 
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Random;
 
 public class KitEffectRenderer {
     
     private static final ConcurrentHashMap<String, EffectData> activeEffects = new ConcurrentHashMap<>();
+    private static final Random random = new Random();
     
     /**
      * Strike a player with lightning for loading a kit
@@ -23,18 +24,18 @@ public class KitEffectRenderer {
         String playerName = player.getName().getString();
         TaggerMod.LOGGER.info("[KitEffectRenderer] Striking {} with lightning for loading a kit!", playerName);
         
-        // Strike the player with lightning once
-        strikeLightning(player);
+        // Strike the player with 4 lightning bolts at the same time
+        strikeMultipleLightning(player);
         
-        // Add cylinder particle effect that starts after lightning
+        // Add effect data for tracking
         EffectData effect = new EffectData(player, System.currentTimeMillis());
         activeEffects.put(playerName, effect);
     }
     
     /**
-     * Strike a player with dramatic lightning
+     * Strike a player with 4 lightning bolts at the same time
      */
-    private static void strikeLightning(PlayerEntity player) {
+    private static void strikeMultipleLightning(PlayerEntity player) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.world == null || client.player == null) {
             return;
@@ -42,69 +43,35 @@ public class KitEffectRenderer {
         
         Vec3d playerPos = player.getPos();
         
-        // Create a lightning bolt entity at the player's position
-        LightningEntity lightning = new LightningEntity(EntityType.LIGHTNING_BOLT, client.world);
-        lightning.refreshPositionAfterTeleport(playerPos.x, playerPos.y, playerPos.z);
-        
-        // Add the lightning to the world (correct method)
-        client.world.addEntity(lightning);
-        
-        // Play dramatic lightning sounds
+        // Play one thunder sound at the player's position
         client.world.playSound(client.player, playerPos.x, playerPos.y, playerPos.z, 
             SoundEvents.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.WEATHER, 1.0f, 1.0f);
         client.world.playSound(client.player, playerPos.x, playerPos.y, playerPos.z, 
             SoundEvents.ENTITY_LIGHTNING_BOLT_IMPACT, SoundCategory.WEATHER, 0.8f, 1.2f);
         
-        TaggerMod.LOGGER.info("[KitEffectRenderer] Lightning strike spawned at {}, {}, {}", 
-            playerPos.x, playerPos.y, playerPos.z);
-    }
-    
-    /**
-     * Create cylinder particle effects around the player
-     */
-    private static void spawnCylinderEffect(PlayerEntity player, float progress) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.world == null) return;
-        
-        Vec3d playerPos = player.getPos();
-        float time = System.currentTimeMillis() / 1000.0f;
-        
-        // Create vertical cylinder pillars around the player
-        int pillarCount = 8; // Number of pillars forming the cylinder
-        for (int pillar = 0; pillar < pillarCount; pillar++) {
-            float pillarAngle = pillar * 2.0f * (float)Math.PI / pillarCount;
-            float pillarRadius = 3.0f; // Cylinder radius
-            float pillarX = (float)playerPos.x + pillarRadius * MathHelper.cos(pillarAngle);
-            float pillarZ = (float)playerPos.z + pillarRadius * MathHelper.sin(pillarAngle);
+        // Strike with exactly 4 lightning bolts at the same time, all on the player
+        for (int i = 0; i < 4; i++) {
+            // Create lightning directly on the player
+            Vec3d lightningPos = new Vec3d(
+                playerPos.x,
+                playerPos.y,
+                playerPos.z
+            );
             
-            // Create vertical pillars going up
-            for (int height = 0; height < 12; height++) { // 12 blocks tall cylinder
-                float y = (float)playerPos.y + height + MathHelper.sin(time * 2.0f + height * 0.1f) * 0.2f;
-                
-                client.world.addParticle(ParticleTypes.END_ROD, pillarX, y, pillarZ, 0, 0.05, 0);
-                client.world.addParticle(ParticleTypes.SOUL_FIRE_FLAME, pillarX, y, pillarZ, 0, 0.02, 0);
-            }
-        }
-        
-        // Add some inner particles for more density
-        int innerPillars = 4;
-        for (int pillar = 0; pillar < innerPillars; pillar++) {
-            float pillarAngle = pillar * 2.0f * (float)Math.PI / innerPillars + time * 1.5f;
-            float pillarRadius = 1.5f; // Inner cylinder radius
-            float pillarX = (float)playerPos.x + pillarRadius * MathHelper.cos(pillarAngle);
-            float pillarZ = (float)playerPos.z + pillarRadius * MathHelper.sin(pillarAngle);
+            // Create a lightning bolt entity
+            LightningEntity lightning = new LightningEntity(EntityType.LIGHTNING_BOLT, client.world);
+            lightning.refreshPositionAfterTeleport(lightningPos.x, lightningPos.y, lightningPos.z);
             
-            // Shorter inner pillars
-            for (int height = 0; height < 8; height++) {
-                float y = (float)playerPos.y + height + MathHelper.sin(time * 3.0f + height * 0.2f) * 0.3f;
-                
-                client.world.addParticle(ParticleTypes.FIREWORK, pillarX, y, pillarZ, 0, 0.08, 0);
-            }
+            // Add the lightning to the world
+            client.world.addEntity(lightning);
+            
+            TaggerMod.LOGGER.info("[KitEffectRenderer] Lightning strike {} spawned on player at {}, {}, {}", 
+                i + 1, lightningPos.x, lightningPos.y, lightningPos.z);
         }
     }
     
     /**
-     * Update cylinder particle effects
+     * Update effects (minimal - just cleanup)
      */
     public static void tick() {
         MinecraftClient client = MinecraftClient.getInstance();
@@ -114,13 +81,13 @@ public class KitEffectRenderer {
         
         long currentTime = System.currentTimeMillis();
         
-        // Update existing cylinder effects
+        // Clean up expired effects (after 1 second)
         activeEffects.entrySet().removeIf(entry -> {
             EffectData effect = entry.getValue();
             PlayerEntity player = effect.player;
             
-            // Effect lasts 3 seconds
-            if (currentTime - effect.startTime > 3000) {
+            // Effect lasts 1 second
+            if (currentTime - effect.startTime > 1000) {
                 return true; // Remove expired effect
             }
             
@@ -128,12 +95,6 @@ public class KitEffectRenderer {
             if (player == null || !player.isAlive()) {
                 return true; // Remove invalid effect
             }
-            
-            // Calculate effect progress (0.0 to 1.0)
-            float progress = Math.min(1.0f, (currentTime - effect.startTime) / 3000.0f);
-            
-            // Spawn cylinder particle effects
-            spawnCylinderEffect(player, progress);
             
             return false; // Keep the effect
         });
@@ -151,4 +112,4 @@ public class KitEffectRenderer {
             this.startTime = startTime;
         }
     }
-} 
+}

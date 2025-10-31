@@ -12,6 +12,7 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.GameMode;
 import net.minecraft.world.World;
 
+
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
@@ -41,15 +42,68 @@ public class GhostTotemDetector {
     // Track which hand last held the totem ("Mainhand", "Offhand", or "Unknown")
     private static String lastTotemHand = "Unknown";
     
+    // Mode tracking and delayed message tracking
+    private static boolean macroMode = false;
+    private static boolean clipboardMode = true; // Default to clipboard mode
+    private static long lastGhostDetectionTime = 0;
+    private static boolean macroReminderScheduled = false;
+    
     // Constants
     private static final double SECONDS_PER_TICK = 0.05; // 50ms per tick (20 ticks per second)
 
     // Pattern to detect death chat messages like "<player> was killed" or "<player> was killed by <killer>" (with optional '!')
     private static final Pattern CHAT_DEATH_PATTERN = Pattern.compile("([a-zA-Z0-9_]+) was killed(?: by [a-zA-Z0-9_]+)?!?", Pattern.CASE_INSENSITIVE);
 
+    // Toggle macro mode for chat macro functionality
+    public static void toggleMacroMode() {
+        macroMode = !macroMode;
+        clipboardMode = !macroMode; // When macro mode is on, clipboard mode is off
+        if (MinecraftClient.getInstance().player != null) {
+            String statusMessage = macroMode ? 
+                "§a[Ghost Detector] Chat macro mode ENABLED" : 
+                "§c[Ghost Detector] Chat macro mode DISABLED";
+            MinecraftClient.getInstance().player.sendMessage(Text.literal(statusMessage), false);
+        }
+        TaggerMod.LOGGER.info("[GhostTotem] Macro mode toggled to: {}", macroMode);
+    }
+    
+    // Toggle clipboard mode for clipboard functionality
+    public static void toggleClipboardMode() {
+        clipboardMode = !clipboardMode;
+        macroMode = !clipboardMode; // When clipboard mode is on, macro mode is off
+        if (MinecraftClient.getInstance().player != null) {
+            String statusMessage = clipboardMode ? 
+                "§a[Ghost Detector] Clipboard mode ENABLED" : 
+                "§c[Ghost Detector] Clipboard mode DISABLED";
+            MinecraftClient.getInstance().player.sendMessage(Text.literal(statusMessage), false);
+        }
+        TaggerMod.LOGGER.info("[GhostTotem] Clipboard mode toggled to: {}", clipboardMode);
+    }
+    
+    // Get current macro mode status
+    public static boolean isMacroModeEnabled() {
+        return macroMode;
+    }
+    
+    // Get current clipboard mode status
+    public static boolean isClipboardModeEnabled() {
+        return clipboardMode;
+    }
+    
     // Called every client tick
     public static void tick(MinecraftClient client) {
         gameTickCounter++; // Increment our own tick counter for precise timing
+        
+        // Handle delayed macro reminder message
+        if (macroReminderScheduled && lastGhostDetectionTime > 0) {
+            long currentTime = System.currentTimeMillis();
+            if (currentTime - lastGhostDetectionTime >= 3000) { // 3 seconds
+                if (client.player != null) {
+                    client.player.sendMessage(Text.literal("§e[Ghost Detector] Do /gd macro for chat macro mode or /gd clipboard for clipboard mode (check your server's rules!)"), false);
+                }
+                macroReminderScheduled = false;
+            }
+        }
         
         if (client.player == null || client.player.getInventory() == null) {
             // Reset if player or inventory is not available (e.g., title screen)
@@ -189,30 +243,44 @@ public class GhostTotemDetector {
             // ---------------------------------------------
             //  Ghost-via-Inventory-Clear detection
             // ---------------------------------------------
-            int emptySlots = countEmptyInventorySlots(player);
-            boolean inventoryLikelyCleared = emptySlots >= 27; // 75%+ empty
+            // ONLY check for inventory clear if we were ACTUALLY holding a totem when it disappeared
+            boolean wasActuallyHoldingTotem = wasHoldingTotemLastTick;
+            
+            if (wasActuallyHoldingTotem) {
+                int emptySlots = countEmptyInventorySlots(player);
+                boolean inventoryLikelyCleared = emptySlots >= 27; // 75%+ empty
 
-            ItemStack mainNow = player.getInventory().main.get(player.getInventory().selectedSlot);
-            ItemStack offNow  = player.getOffHandStack();
-            boolean handNowEmpty = mainNow.isEmpty() || offNow.isEmpty();
+                ItemStack mainNow = player.getInventory().main.get(player.getInventory().selectedSlot);
+                ItemStack offNow  = player.getOffHandStack();
+                boolean handNowEmpty = mainNow.isEmpty() || offNow.isEmpty();
 
-            // Ignore if we actually popped a totem very recently (server sends status 35)
-            long now = System.currentTimeMillis();
-            boolean poppedRecently = (now - lastTotemPopTime) < 2000; // 2-s window
-            boolean recentChatDeath = (now - lastSelfDeathChatTime) < 5000; // 5-second window
+                // Ignore if we actually popped a totem very recently (server sends status 35)
+                long now = System.currentTimeMillis();
+                boolean poppedRecently = (now - lastTotemPopTime) < 2000; // 2-s window
+                boolean recentChatDeath = (now - lastSelfDeathChatTime) < 5000; // 5-second window
 
-            if (TaggerMod.DEBUG_MODE) {
-                TaggerMod.LOGGER.info("[GhostTotem]   inventoryLikelyCleared = {} ({} empty)", inventoryLikelyCleared, emptySlots);
-                TaggerMod.LOGGER.info("[GhostTotem]   handNowEmpty         = {}", handNowEmpty);
-                TaggerMod.LOGGER.info("[GhostTotem]   poppedRecently       = {} ({} ms ago)", poppedRecently, now - lastTotemPopTime);
-                TaggerMod.LOGGER.info("[GhostTotem]   recentChatDeath      = {} ({} ms ago)", recentChatDeath, now - lastSelfDeathChatTime);
-            }
+                if (TaggerMod.DEBUG_MODE) {
+                    TaggerMod.LOGGER.info("[GhostTotem]   wasActuallyHoldingTotem = {}", wasActuallyHoldingTotem);
+                    TaggerMod.LOGGER.info("[GhostTotem]   inventoryLikelyCleared = {} ({} empty)", inventoryLikelyCleared, emptySlots);
+                    TaggerMod.LOGGER.info("[GhostTotem]   handNowEmpty         = {}", handNowEmpty);
+                    TaggerMod.LOGGER.info("[GhostTotem]   poppedRecently       = {} ({} ms ago)", poppedRecently, now - lastTotemPopTime);
+                    TaggerMod.LOGGER.info("[GhostTotem]   recentChatDeath      = {} ({} ms ago)", recentChatDeath, now - lastSelfDeathChatTime);
+                }
 
-            if (inventoryLikelyCleared && handNowEmpty && !poppedRecently && recentChatDeath) {
-                TaggerMod.LOGGER.info("[GhostTotem] Inventory appears cleared ({} empty slots) right after totem disappeared — treating as ghost.", emptySlots);
+                if (inventoryLikelyCleared && handNowEmpty && !poppedRecently && recentChatDeath) {
+                    TaggerMod.LOGGER.info("[GhostTotem] Player was holding totem when inventory cleared ({} empty slots) — treating as ghost.", emptySlots);
 
-                // Use the regular onPlayerDeath pathway to reuse broadcast logic before we zero the timer.
-                onPlayerDeath(player, false);
+                    // Use the regular onPlayerDeath pathway to reuse broadcast logic before we zero the timer.
+                    onPlayerDeath(player, false);
+                } else {
+                    if (TaggerMod.DEBUG_MODE) {
+                        TaggerMod.LOGGER.info("[GhostTotem] Inventory clear conditions not met - NOT treating as ghost");
+                    }
+                }
+            } else {
+                if (TaggerMod.DEBUG_MODE) {
+                    TaggerMod.LOGGER.info("[GhostTotem] Player was NOT holding totem when unequipped - NOT checking inventory clear");
+                }
             }
             
             totemEquipTimeNano = 0;
@@ -271,17 +339,16 @@ public class GhostTotemDetector {
                              handType.toLowerCase(), TIME_FORMAT.format(new Date(System.currentTimeMillis() - durationMillis)), 
                              TIME_FORMAT.format(new Date()), durationMillis, ticksHeld);
 
-            // Check for players in render distance and send message accordingly
+            // Check for players in render distance and prepare message accordingly
             MinecraftClient client = MinecraftClient.getInstance();
-            if (client.player != null && client.getNetworkHandler() != null && client.world != null) {
+            if (client.player != null && client.world != null) {
                 String publicMessage;
-                if (spectatorTransition) {
-                    // For spectator transitions, use a specific message without timing
-                    publicMessage = String.format("[INSIGNIA] <%s Ghost Detected>", handType);
+                // Include timing info only when duration is <= 300ms; otherwise omit timing
+                if (durationMillis <= 300) {
+                    publicMessage = String.format("<%s Ghost Detected> totem held for %dms (%d ticks)",
+                                                 handType, durationMillis, ticksHeld);
                 } else {
-                    // For other deaths (potential ghost totems), include timing info
-                    publicMessage = String.format("[INSIGNIA] <%s Ghost Detected> totem held for %dms (%d ticks)", 
-                                                     handType, durationMillis, ticksHeld);
+                    publicMessage = String.format("<%s Ghost Detected>", handType);
                 }
                 
                 // Get players in render distance (using a reasonable render distance of ~16 blocks)
@@ -298,22 +365,40 @@ public class GhostTotemDetector {
                 
                 TaggerMod.LOGGER.info("[GhostTotem] Found {} players in render distance", nearbyPlayers.size());
                 
+                String commandToSend;
                 if (nearbyPlayers.size() == 1) {
-                    // Exactly one player in render distance - send private message
+                    // Exactly one player in render distance - prepare private message
                     PlayerEntity targetPlayer = nearbyPlayers.get(0);
                     String targetPlayerName = targetPlayer.getName().getString();
-                    
-                    TaggerMod.LOGGER.info("[GhostTotem] Sending private message to {}", targetPlayerName);
-                    client.getNetworkHandler().sendChatCommand("w " + targetPlayerName + " " + publicMessage);
+                    commandToSend = "/w " + targetPlayerName + " " + publicMessage;
+                    TaggerMod.LOGGER.info("[GhostTotem] Prepared private message to {}", targetPlayerName);
                 } else {
-                    // 0 or more than 1 player in render distance - send to global chat
-                    TaggerMod.LOGGER.info("[GhostTotem] Sending to global chat (not exactly 1 player in range)");
-                    client.getNetworkHandler().sendChatMessage(publicMessage);
+                    // 0 or more than 1 player in render distance - prepare global chat message
+                    commandToSend = publicMessage;
+                    TaggerMod.LOGGER.info("[GhostTotem] Prepared global chat message");
                 }
+                
+                                 // Send message based on mode
+                 if (macroMode && client.getNetworkHandler() != null) {
+                     // Macro mode enabled - send command directly
+                     if (nearbyPlayers.size() == 1) {
+                         client.getNetworkHandler().sendChatCommand("w " + nearbyPlayers.get(0).getName().getString() + " " + publicMessage);
+                     } else {
+                         client.getNetworkHandler().sendChatMessage(publicMessage);
+                     }
+                     TaggerMod.LOGGER.info("[GhostTotem] Sent command via macro mode");
+                 } else if (clipboardMode) {
+                     // Clipboard mode enabled - send big message and copy to clipboard
+                     sendGhostDetectionMessage(commandToSend, handType, durationMillis, ticksHeld);
+                 } else {
+                     // Both modes disabled - just log the detection
+                     TaggerMod.LOGGER.info("[GhostTotem] Ghost detected but both modes are disabled");
+                 }
             }
 
             // Reset the timer immediately to prevent multiple messages for the same death event
             totemEquipTimeNano = 0;
+            ghostTotemHoldTime = 0;
         } else {
             // Log that a death was detected, but no totem was active
             TaggerMod.LOGGER.info("[GhostTotem] Death detected, but no totem was being held.");
@@ -335,9 +420,27 @@ public class GhostTotemDetector {
                     // Mark time so we do not double-process this death.
                     lastGhostTotemTime = System.currentTimeMillis();
 
-                    String publicMessage = "[INSIGNIA] <Ghost Detected>";
+                    // Calculate timing information if we have recent totem hold data
+                    long durationMillis = 0;
+                    long ticksHeld = 0;
+                    String handType = "Unknown";
+                    
+                    if (ghostTotemHoldTime > 0) {
+                        durationMillis = ghostTotemHoldTime;
+                        ticksHeld = durationMillis / 50; // Convert ms to ticks (20 ticks per second = 50ms per tick)
+                        handType = lastTotemHand;
+                    }
 
-                    // Send message to exactly one nearby player if possible, otherwise to global chat
+                    String publicMessage;
+                    // Include timing info only when duration is <= 300ms; otherwise omit timing
+                    if (durationMillis > 0 && durationMillis <= 300) {
+                        publicMessage = String.format("<%s Ghost Detected> totem held for %dms (%d ticks)",
+                                                     handType, durationMillis, ticksHeld);
+                    } else {
+                        publicMessage = String.format("<%s Ghost Detected>", handType);
+                    }
+
+                    // Prepare message for exactly one nearby player if possible, otherwise to global chat
                     if (client.world != null) {
                         World world = client.world;
                         Vec3d playerPos = client.player.getPos();
@@ -350,16 +453,36 @@ public class GhostTotemDetector {
 
                         TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Found {} players in render distance", nearbyPlayers.size());
 
+                        String commandToSend;
                         if (nearbyPlayers.size() == 1) {
                             PlayerEntity targetPlayer = nearbyPlayers.get(0);
                             String targetPlayerName = targetPlayer.getName().getString();
-
-                            TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Sending private message to {}", targetPlayerName);
-                            client.getNetworkHandler().sendChatCommand("w " + targetPlayerName + " " + publicMessage);
-                        } else if (client.getNetworkHandler() != null) {
-                            TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Sending to global chat");
-                            client.getNetworkHandler().sendChatMessage(publicMessage);
+                            commandToSend = "/w " + targetPlayerName + " " + publicMessage;
+                            TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Prepared private message to {}", targetPlayerName);
+                        } else {
+                            commandToSend = publicMessage;
+                            TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Prepared global chat message");
                         }
+                        
+                                                 // Send message based on mode
+                         if (macroMode && client.getNetworkHandler() != null) {
+                             // Macro mode enabled - send command directly
+                             if (nearbyPlayers.size() == 1) {
+                                 client.getNetworkHandler().sendChatCommand("w " + nearbyPlayers.get(0).getName().getString() + " " + publicMessage);
+                             } else {
+                                 client.getNetworkHandler().sendChatMessage(publicMessage);
+                             }
+                             TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Sent command via macro mode");
+                         } else if (clipboardMode) {
+                             // Clipboard mode enabled - send big message and copy to clipboard
+                             sendGhostDetectionMessage(commandToSend, handType, durationMillis, ticksHeld);
+                         } else {
+                             // Both modes disabled - just log the detection
+                             TaggerMod.LOGGER.info("[GhostTotem] (No-totem) Ghost detected but both modes are disabled");
+                         }
+                         
+                         // Reset the ghost totem hold time after use
+                         ghostTotemHoldTime = 0;
                     }
                 }
             }
@@ -440,6 +563,40 @@ public class GhostTotemDetector {
         }
     }
 
+    // Send big unmissable message and copy command to clipboard
+    private static void sendGhostDetectionMessage(String command, String handType, long durationMillis, long ticksHeld) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return;
+        
+        // Copy the command to clipboard using Minecraft's clipboard system
+        try {
+            if (client.keyboard != null) {
+                client.keyboard.setClipboard(command);
+                TaggerMod.LOGGER.info("[GhostTotem] Command copied to clipboard: {}", command);
+            } else {
+                TaggerMod.LOGGER.error("[GhostTotem] Failed to copy to clipboard: Minecraft keyboard is null");
+            }
+        } catch (Exception e) {
+            TaggerMod.LOGGER.error("[GhostTotem] Failed to copy to clipboard: {}", e.getMessage());
+        }
+        
+        // Send big unmissable multi-line message
+        client.player.sendMessage(Text.literal("§c§l" + "=".repeat(50)), false);
+        client.player.sendMessage(Text.literal("§c§l🚨 GHOST TOTEM DETECTED! 🚨"), false);
+        client.player.sendMessage(Text.literal("§c§l" + "=".repeat(50)), false);
+        client.player.sendMessage(Text.literal("§eHand: §f" + handType), false);
+        client.player.sendMessage(Text.literal("§eDuration: §f" + durationMillis + "ms (" + ticksHeld + " ticks)"), false);
+        client.player.sendMessage(Text.literal("§c§l" + "=".repeat(50)), false);
+        client.player.sendMessage(Text.literal("§aCommand copied to clipboard!"), false);
+        client.player.sendMessage(Text.literal("§aPaste it in chat to report the ghost:"), false);
+        client.player.sendMessage(Text.literal("§7" + command), false);
+        client.player.sendMessage(Text.literal("§c§l" + "=".repeat(50)), false);
+        
+        // Schedule the macro reminder
+        lastGhostDetectionTime = System.currentTimeMillis();
+        macroReminderScheduled = true;
+    }
+    
     // Called by TotemPopMixin when the server tells the client we used a totem (status 35)
     public static void onLocalPlayerTotemPop() {
         lastTotemPopTime = System.currentTimeMillis();
@@ -447,4 +604,4 @@ public class GhostTotemDetector {
             TaggerMod.LOGGER.info("[GhostTotem] Local player totem pop detected via status packet");
         }
     }
-} 
+}

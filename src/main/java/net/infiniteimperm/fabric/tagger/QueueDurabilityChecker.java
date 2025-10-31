@@ -123,13 +123,7 @@ public class QueueDurabilityChecker {
      * Send durability warning to the player
      */
     private static void sendDurabilityWarning(PlayerEntity player, ArmorDurabilityResult result) {
-        player.sendMessage(Text.literal(""), false); // Empty line
-        player.sendMessage(Text.literal("⚠ WARNING: Your armor is damaged!").formatted(Formatting.YELLOW, Formatting.BOLD), false);
-        player.sendMessage(Text.literal("Average durability: " + Math.round(result.averageDurabilityPercent * 100) + "%").formatted(Formatting.RED), false);
-        player.sendMessage(Text.literal("Armor details: " + result.durabilityDetails).formatted(Formatting.GRAY), false);
-        player.sendMessage(Text.literal(""), false); // Empty line
-        player.sendMessage(Text.literal("Run the same command again to confirm queueing with damaged gear.").formatted(Formatting.YELLOW), false);
-        player.sendMessage(Text.literal("Or repair/replace your armor first for optimal performance.").formatted(Formatting.GREEN), false);
+        player.sendMessage(Text.literal("§cREKIT FIRST OR /q again to confirm").formatted(Formatting.RED, Formatting.BOLD), false);
     }
     
     /**
@@ -157,4 +151,4 @@ public class QueueDurabilityChecker {
             this.durabilityDetails = durabilityDetails;
         }
     }
-} 
+}

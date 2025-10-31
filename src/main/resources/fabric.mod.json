@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "tagger",
+  "id": "insignia",
   "version": "${version}",
 
-  "name": "Tagger",
-  "description": "A simple player tagging mod",
+  "name": "Insignia",
+  "description": "A Minecraft Fabric mod with QoL features including ghost totem detection, kit detection with visual effects, and queue armor durability checking",
   "authors": [
     "InfiniteImperm"
   ],

@@ -52,7 +52,7 @@ loom {
 			name "Data Generation"
 			vmArg "-Dfabric-api.datagen"
 			vmArg "-Dfabric-api.datagen.output-dir=${file("src/main/generated")}"
-			vmArg "-Dfabric-api.datagen.modid=tagger"
+			vmArg "-Dfabric-api.datagen.modid=insignia"
  
 			runDir "build/datagen"
 		}
@@ -90,16 +90,16 @@ jar {
 	}
 }
 
-// Add a task to copy the mod to the MultiMC instance
-task copyToMultiMC(type: Copy) {
+// Add a task to copy the mod to the PrismLauncher instance
+task copyToPrismLauncher(type: Copy) {
     dependsOn remapJar
     from remapJar.archiveFile
-    into "C:/Users/Terac/Documents/mmc-develop-win32/MultiMC/instances/Simply Optimized 1.21.3-1.0/.minecraft/mods"
+    into "C:/Users/Terac/AppData/Roaming/PrismLauncher/instances/Simply Optimized 1.21.3-1.0/.minecraft/mods"
     rename { "Insignia.jar" }
 }
 
-// Make the build task depend on copyToMultiMC so it automatically copies the JAR
-build.finalizedBy(copyToMultiMC)
+// Make the build task depend on copyToPrismLauncher so it automatically copies the JAR
+build.finalizedBy(copyToPrismLauncher)
 
 // configure the maven publication
 publishing {

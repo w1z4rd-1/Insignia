@@ -59,4 +59,4 @@ public abstract class TotemPopMixin {
             GhostTotemDetector.onLocalPlayerTotemPop();
         }
     }
-} 
+}
