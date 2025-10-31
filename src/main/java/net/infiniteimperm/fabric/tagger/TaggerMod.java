@@ -19,12 +19,19 @@ public class TaggerMod implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         LOGGER.info("Insignia Mod initialized");
+        
+        // Load configuration
+        InsigniaConfig.load();
+        
+        // Sync Ghost Totem Detector state with config
+        GhostTotemDetector.syncWithConfig();
 
         // Register the tick event for various trackers
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             QueueDurabilityChecker.resetConfirmation(); // Reset confirmation timeout
             GhostTotemDetector.tick(client);
             KitDetector.tick(); // Add KitDetector tick
+            PlayerHighlightTracker.tick(client); // Track player highlight states
         });
         
         // Register event for processing chat messages
@@ -48,6 +55,15 @@ public class TaggerMod implements ClientModInitializer {
         
         // Register the /gd commands
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+            // Register /insignia command to open config GUI
+            dispatcher.register(ClientCommandManager.literal("insignia")
+                .executes(context -> {
+                    MinecraftClient client = context.getSource().getClient();
+                    client.send(() -> client.setScreen(InsigniaConfigScreen.createConfigScreen(client.currentScreen)));
+                    return 1;
+                })
+            );
+            
             dispatcher.register(ClientCommandManager.literal("gd")
                 .then(ClientCommandManager.literal("macro")
                     .executes(context -> {

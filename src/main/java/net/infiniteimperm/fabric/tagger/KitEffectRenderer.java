@@ -21,6 +21,11 @@ public class KitEffectRenderer {
      * Strike a player with lightning for loading a kit
      */
     public static void addEffect(PlayerEntity player) {
+        // Check if lightning effect is enabled
+        if (!InsigniaConfig.getInstance().kitLightningEnabled) {
+            return;
+        }
+        
         String playerName = player.getName().getString();
         TaggerMod.LOGGER.info("[KitEffectRenderer] Striking {} with lightning for loading a kit!", playerName);
         

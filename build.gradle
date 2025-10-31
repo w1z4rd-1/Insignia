@@ -20,6 +20,10 @@ repositories {
 		name = 'Fabric'
 		url = 'https://maven.fabricmc.net/'
 	}
+	maven {
+		name = 'Shedaniel Maven'
+		url = 'https://maven.shedaniel.me/'
+	}
 	mavenCentral()
 }
 
@@ -32,8 +36,12 @@ dependencies {
 	// Fabric API
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 	
+	// Cloth Config API for nice config GUI
+	modImplementation "me.shedaniel.cloth:cloth-config-fabric:15.0.140"
+	
 	// Include Fabric API as a Jar-in-Jar dependency
 	include "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+	include "me.shedaniel.cloth:cloth-config-fabric:15.0.140"
 }
 
 processResources {

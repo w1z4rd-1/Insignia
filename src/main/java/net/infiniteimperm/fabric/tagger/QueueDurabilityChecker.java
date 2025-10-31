@@ -8,7 +8,7 @@ import net.minecraft.util.Formatting;
 
 public class QueueDurabilityChecker {
     
-    private static final float MIN_DURABILITY_PERCENT = 0.95f; // 95%
+    // MIN_DURABILITY_PERCENT is now read from config
     private static boolean awaitingConfirmation = false;
     private static String pendingCommand = null;
     private static long lastWarningTime = 0;
@@ -29,6 +29,11 @@ public class QueueDurabilityChecker {
      * @return true if command should be blocked, false if it should proceed
      */
     public static boolean processQueueCommand(String command) {
+        // Check if feature is enabled
+        if (!InsigniaConfig.getInstance().queueDurabilityEnabled) {
+            return false; // Let command proceed if feature is disabled
+        }
+        
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) {
             return false; // Let command proceed if no player
@@ -102,7 +107,8 @@ public class QueueDurabilityChecker {
                 
                 totalDurabilityPercent += durabilityPercent;
                 
-                if (durabilityPercent < MIN_DURABILITY_PERCENT) {
+                float minDurability = InsigniaConfig.getInstance().queueDurabilityThreshold;
+                if (durabilityPercent < minDurability) {
                     allArmorFresh = false;
                 }
                 

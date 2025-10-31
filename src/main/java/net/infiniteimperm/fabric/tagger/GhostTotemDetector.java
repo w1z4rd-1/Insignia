@@ -56,8 +56,13 @@ public class GhostTotemDetector {
 
     // Toggle macro mode for chat macro functionality
     public static void toggleMacroMode() {
-        macroMode = !macroMode;
-        clipboardMode = !macroMode; // When macro mode is on, clipboard mode is off
+        InsigniaConfig config = InsigniaConfig.getInstance();
+        config.ghostTotemMacroMode = !config.ghostTotemMacroMode;
+        config.ghostTotemClipboardMode = !config.ghostTotemMacroMode;
+        macroMode = config.ghostTotemMacroMode;
+        clipboardMode = config.ghostTotemClipboardMode;
+        InsigniaConfig.save();
+        
         if (MinecraftClient.getInstance().player != null) {
             String statusMessage = macroMode ? 
                 "§a[Ghost Detector] Chat macro mode ENABLED" : 
@@ -69,8 +74,13 @@ public class GhostTotemDetector {
     
     // Toggle clipboard mode for clipboard functionality
     public static void toggleClipboardMode() {
-        clipboardMode = !clipboardMode;
-        macroMode = !clipboardMode; // When clipboard mode is on, macro mode is off
+        InsigniaConfig config = InsigniaConfig.getInstance();
+        config.ghostTotemClipboardMode = !config.ghostTotemClipboardMode;
+        config.ghostTotemMacroMode = !config.ghostTotemClipboardMode;
+        clipboardMode = config.ghostTotemClipboardMode;
+        macroMode = config.ghostTotemMacroMode;
+        InsigniaConfig.save();
+        
         if (MinecraftClient.getInstance().player != null) {
             String statusMessage = clipboardMode ? 
                 "§a[Ghost Detector] Clipboard mode ENABLED" : 
@@ -90,8 +100,21 @@ public class GhostTotemDetector {
         return clipboardMode;
     }
     
+    // Sync internal state with config (called on init)
+    public static void syncWithConfig() {
+        InsigniaConfig config = InsigniaConfig.getInstance();
+        macroMode = config.ghostTotemMacroMode;
+        clipboardMode = config.ghostTotemClipboardMode;
+        TaggerMod.LOGGER.info("[GhostTotem] Synced with config - Macro: {}, Clipboard: {}", macroMode, clipboardMode);
+    }
+    
     // Called every client tick
     public static void tick(MinecraftClient client) {
+        // Check if feature is enabled
+        if (!InsigniaConfig.getInstance().ghostTotemEnabled) {
+            return;
+        }
+        
         gameTickCounter++; // Increment our own tick counter for precise timing
         
         // Handle delayed macro reminder message

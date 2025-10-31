@@ -5,6 +5,7 @@
   "mixins": [],
   "client": [
     "CommandInterceptorMixin",
+    "PlayerEntityRendererMixin",
     "TotemPopMixin"
   ],
   "injectors": {

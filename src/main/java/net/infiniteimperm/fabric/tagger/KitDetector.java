@@ -27,6 +27,11 @@ public class KitDetector {
      * Process a chat message to detect kit loading
      */
     public static void onChatMessage(String message) {
+        // Check if feature is enabled
+        if (!InsigniaConfig.getInstance().kitDetectorEnabled) {
+            return;
+        }
+        
         // Debug: Log all chat messages to see what we're receiving
         if (TaggerMod.DEBUG_MODE) {
             TaggerMod.LOGGER.info("[KitDetector] Received chat message: '{}'", message);

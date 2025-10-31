@@ -18,6 +18,11 @@ public class TotemWarningOverlay {
      * @return true if the player is not holding a totem but has one in inventory, false otherwise.
      */
     public static boolean shouldShowWarning() {
+        // Check if feature is enabled
+        if (!InsigniaConfig.getInstance().totemWarningEnabled) {
+            return false;
+        }
+        
         if (client.player == null) {
             return false;
         }
