@@ -535,12 +535,12 @@ public final class DiagnoseOrchestrator {
                 }
                 notes.add("nsys UAC fallback failed with exitCode=" + elevated.exitCode() + " timedOut=" + elevated.timedOut());
                 if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes, captureSeconds)) {
-                        announceStarted("Nsight Systems");
-                        return NsysStartMode.TIMED_PROFILE;
-                    }
-                    return NsysStartMode.NOT_STARTED;
+                    announceStarted("Nsight Systems");
+                    return NsysStartMode.TIMED_PROFILE;
                 }
-                notes.add("Attempted nsys session start.");
+                return NsysStartMode.NOT_STARTED;
+            }
+            notes.add("Attempted nsys session start.");
             announceStarted("Nsight Systems");
             return NsysStartMode.SESSION;
         } catch (Exception e) {
@@ -906,6 +906,27 @@ public final class DiagnoseOrchestrator {
         }
     }
 
+    private String readTail(Path file, int maxBytes) {
+        try {
+            if (file == null || !Files.exists(file)) {
+                return "";
+            }
+            long size = Files.size(file);
+            if (size <= maxBytes) {
+                return Files.readString(file, StandardCharsets.UTF_8);
+            }
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file.toFile(), "r")) {
+                long offset = size - maxBytes;
+                raf.seek(offset);
+                byte[] buf = new byte[maxBytes];
+                int read = raf.read(buf);
+                return new String(buf, 0, read, StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     private boolean runWprCancel(ToolDetection.DetectionReport report, Path runDir, List<String> notes, boolean elevated) {
         try {
             Path stdout = runDir.resolve("logs").resolve("wpr-cancel.stdout.log");
@@ -1167,7 +1188,7 @@ public final class DiagnoseOrchestrator {
                 notes.add("spark URL fetch skipped: latest.log not found.");
                 return 0;
             }
-            String logText = Files.readString(gameLatestLog, StandardCharsets.UTF_8);
+            String logText = readTail(gameLatestLog, 512 * 1024);
             Matcher matcher = SPARK_URL_PATTERN.matcher(logText);
             String found = null;
             while (matcher.find()) {

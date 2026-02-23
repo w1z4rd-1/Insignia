@@ -200,10 +200,13 @@ public final class BundleWriter {
         if (name.equals("system_info.json")) {
             return;
         }
+        String content = Files.readString(file, StandardCharsets.UTF_8);
         if (name.equals("options.txt") || name.contains("sodium") || name.contains("lithium")) {
-            String content = Files.readString(file, StandardCharsets.UTF_8);
-            Files.writeString(file, RedactionUtil.sanitizeKnownConfigContent(content), StandardCharsets.UTF_8);
+            content = RedactionUtil.sanitizeKnownConfigContent(content);
         }
+        // Redact Windows user paths (e.g. C:\Users\<name>\...) present in all text artifacts.
+        content = RedactionUtil.redactUserPathOnly(content);
+        Files.writeString(file, content, StandardCharsets.UTF_8);
     }
 
     private static String escape(String input) {
@@ -351,9 +354,13 @@ public final class BundleWriter {
                     "-NoProfile",
                     "-Command",
                     expr);
+                pb.redirectErrorStream(true);
                 Process process = pb.start();
                 String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-                process.waitFor();
+                boolean finished = process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                }
                 return out.isBlank() ? "unknown" : out;
             } catch (Exception e) {
                 return "unknown";
