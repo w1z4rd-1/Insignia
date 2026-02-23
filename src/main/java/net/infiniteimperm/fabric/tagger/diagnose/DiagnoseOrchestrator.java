@@ -25,6 +25,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class DiagnoseOrchestrator {
     public enum Mode {
@@ -48,6 +49,7 @@ public final class DiagnoseOrchestrator {
 
     private final AtomicBoolean active = new AtomicBoolean(false);
     private volatile Path activeRunDir;
+    private volatile ElevatedHelper elevatedHelper;
 
     private DiagnoseOrchestrator() {
     }
@@ -180,6 +182,7 @@ public final class DiagnoseOrchestrator {
         Path stateFile = null;
         ProfilerSessionState.State state = null;
         try {
+            elevatedHelper = null;
             runDir = createRunDir();
             activeRunDir = runDir;
             Path logsDir = runDir.resolve("logs");
@@ -420,6 +423,12 @@ public final class DiagnoseOrchestrator {
             }
         } finally {
             try {
+                if (elevatedHelper != null) {
+                    elevatedHelper.shutdown();
+                }
+            } catch (Exception ignored) {
+            }
+            try {
                 if (nsysMode == NsysStartMode.SESSION && runDir != null && nsysStopLog != null && nsysSession != null) {
                     stopOptionalNsys(report, runDir, nsysStopLog, notes, nsysSession);
                 }
@@ -503,6 +512,7 @@ public final class DiagnoseOrchestrator {
             if (result.timedOut() || result.exitCode() != 0) {
                 notes.add("nsys start failed with exitCode=" + result.exitCode() + " timedOut=" + result.timedOut());
                 ChatUi.warn("Nsight Systems needs admin rights. Approve the UAC prompt if shown.");
+                ensureElevatedHelper(runDir, notes);
                 ExportCommandResult elevated = runNsysElevated(report, runDir, baseArgs, replaceSuffix(logBaseFile, "-uac.stdout.log"), replaceSuffix(logBaseFile, "-uac.stderr.log"));
                 if (!elevated.success()) {
                     notes.add("nsys UAC fallback failed with exitCode=" + elevated.exitCode() + " timedOut=" + elevated.timedOut());
@@ -519,6 +529,7 @@ public final class DiagnoseOrchestrator {
             String statusLower = readText(stderr).toLowerCase(Locale.ROOT);
             if (statusLower.contains("requires administrative privileges")) {
                 ChatUi.warn("Nsight Systems needs admin rights. Approve the UAC prompt if shown.");
+                ensureElevatedHelper(runDir, notes);
                 try {
                     // If non-elevated start created a degraded session, cancel it before elevated restart.
                     Path cancelStdout = replaceSuffix(logBaseFile, "-cancel.stdout.log");
@@ -580,6 +591,7 @@ public final class DiagnoseOrchestrator {
             // .nsys-rep is written before (or shortly after) bundle export begins.
             int nsysDuration = captureSeconds + 15;
             String script =
+                quickEditDisableScript() +
                 "$ErrorActionPreference='Stop'; " +
                 "$a=@('profile','--trace=none','--sample=none','--cpuctxsw=none','--duration','" + nsysDuration + "','--force-overwrite=true','-o','" + out + "','cmd','/c','timeout /t " + (nsysDuration + 1) + " >nul'); " +
                 "$p=Start-Process -FilePath '" + exe + "' -ArgumentList $a -WindowStyle Normal -PassThru; " +
@@ -628,6 +640,7 @@ public final class DiagnoseOrchestrator {
                 }
                 if (requiresElevation(err)) {
                     ChatUi.warn("WPR needs admin rights. Approve the UAC prompt if shown.");
+                    ensureElevatedHelper(runDir, notes);
                     if (startWprElevated(report, runDir, notes)) {
                         notes.add("Started WPR via elevated UAC fallback.");
                         announceStarted("WPR");
@@ -1054,6 +1067,27 @@ public final class DiagnoseOrchestrator {
             || stderrLower.contains("elevation");
     }
 
+    private synchronized ElevatedHelper ensureElevatedHelper(Path runDir, List<String> notes) {
+        if (elevatedHelper != null && elevatedHelper.isReady()) {
+            return elevatedHelper;
+        }
+        try {
+            Path helperDir = runDir.resolve("logs").resolve("elevated-helper");
+            Path stdout = helperDir.resolve("helper-launch.stdout.log");
+            Path stderr = helperDir.resolve("helper-launch.stderr.log");
+            ElevatedHelper helper = ElevatedHelper.start(helperDir, stdout, stderr);
+            if (helper != null && helper.isReady()) {
+                elevatedHelper = helper;
+                notes.add("Elevated helper started.");
+                return helper;
+            }
+            notes.add("Elevated helper failed to start.");
+        } catch (Exception e) {
+            notes.add("Elevated helper start failed: " + e.getMessage());
+        }
+        return null;
+    }
+
     private boolean startWprElevated(ToolDetection.DetectionReport report, Path runDir, List<String> notes) {
         try {
             Path stdout = runDir.resolve("logs").resolve("wpr-start-uac.stdout.log");
@@ -1098,8 +1132,25 @@ public final class DiagnoseOrchestrator {
     }
 
     private ProcessRunner.ProcessResult runWprElevatedStartCommand(ToolDetection.DetectionReport report, Path runDir, Path stdout, Path stderr) throws Exception {
+        ElevatedHelper helper = elevatedHelper;
+        if (helper != null && helper.isReady()) {
+            ElevatedHelper.CommandResult helperResult = helper.runCommand(
+                report.wpr.path.toAbsolutePath().toString(),
+                List.of("-start", "generalprofile", "-filemode"),
+                runDir.toAbsolutePath().toString(),
+                stdout.toAbsolutePath().toString(),
+                stderr.toAbsolutePath().toString(),
+                30_000L
+            );
+            return new ProcessRunner.ProcessResult(
+                helperResult.exitCode(),
+                helperResult.timedOut(),
+                Duration.ofMillis(helperResult.elapsedMs())
+            );
+        }
         String exe = report.wpr.path.toAbsolutePath().toString().replace("'", "''");
         String script =
+            quickEditDisableScript() +
             "$ErrorActionPreference='Stop'; " +
             "$p=Start-Process -FilePath '" + exe + "' -ArgumentList @('-start','generalprofile','-filemode') -Verb RunAs -PassThru; " +
             "if ($null -eq $p) { exit 1 }; " +
@@ -1110,9 +1161,22 @@ public final class DiagnoseOrchestrator {
 
     private ExportCommandResult runWprStopElevated(ToolDetection.DetectionReport report, Path runDir, Path outEtl, Path stdout, Path stderr) {
         try {
+            ElevatedHelper helper = elevatedHelper;
+            if (helper != null && helper.isReady()) {
+                ElevatedHelper.CommandResult helperResult = helper.runCommand(
+                    report.wpr.path.toAbsolutePath().toString(),
+                    List.of("-stop", outEtl.toAbsolutePath().toString()),
+                    runDir.toAbsolutePath().toString(),
+                    stdout.toAbsolutePath().toString(),
+                    stderr.toAbsolutePath().toString(),
+                    EXPORT_TIMEOUT_MS
+                );
+                return new ExportCommandResult(helperResult.exitCode() == 0 && !helperResult.timedOut(), helperResult.timedOut(), helperResult.exitCode());
+            }
             String exe = report.wpr.path.toAbsolutePath().toString().replace("'", "''");
             String etl = outEtl.toAbsolutePath().toString().replace("'", "''");
             String script =
+                quickEditDisableScript() +
                 "$ErrorActionPreference='Stop'; " +
                 "$p=Start-Process -FilePath '" + exe + "' -ArgumentList @('-stop','" + etl + "') -Verb RunAs -PassThru; " +
                 "if ($null -eq $p) { exit 1 }; " +
@@ -1127,8 +1191,21 @@ public final class DiagnoseOrchestrator {
 
     private ExportCommandResult runNsysElevated(ToolDetection.DetectionReport report, Path runDir, List<String> args, Path stdout, Path stderr) {
         try {
+            ElevatedHelper helper = elevatedHelper;
+            if (helper != null && helper.isReady()) {
+                ElevatedHelper.CommandResult helperResult = helper.runCommand(
+                    report.nsys.path.toAbsolutePath().toString(),
+                    args,
+                    runDir.toAbsolutePath().toString(),
+                    stdout.toAbsolutePath().toString(),
+                    stderr.toAbsolutePath().toString(),
+                    EXPORT_TIMEOUT_MS
+                );
+                return new ExportCommandResult(helperResult.exitCode() == 0 && !helperResult.timedOut(), helperResult.timedOut(), helperResult.exitCode());
+            }
             String exe = report.nsys.path.toAbsolutePath().toString().replace("'", "''");
             StringBuilder scriptBuilder = new StringBuilder();
+            scriptBuilder.append(quickEditDisableScript());
             scriptBuilder.append("$ErrorActionPreference='Stop'; ");
             scriptBuilder.append("$a = New-Object System.Collections.Generic.List[string]; ");
             for (String arg : args) {
@@ -1145,6 +1222,20 @@ public final class DiagnoseOrchestrator {
         } catch (Exception e) {
             return new ExportCommandResult(false, false, -1);
         }
+    }
+
+    private String quickEditDisableScript() {
+        return "$sig='using System;using System.Runtime.InteropServices;public static class InsigniaConsoleMode{"
+            + "[DllImport(\"\"kernel32.dll\"\")] public static extern IntPtr GetStdHandle(int nStdHandle);"
+            + "[DllImport(\"\"kernel32.dll\"\")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out int lpMode);"
+            + "[DllImport(\"\"kernel32.dll\"\")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);}'; "
+            + "try { Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue | Out-Null } catch {}; "
+            + "$h=[InsigniaConsoleMode]::GetStdHandle(-10); "
+            + "$m=0; "
+            + "if ([InsigniaConsoleMode]::GetConsoleMode($h,[ref]$m)) { "
+            + "$m = ($m -band (-bnot 0x40)) -bor 0x80; "
+            + "[InsigniaConsoleMode]::SetConsoleMode($h,$m) | Out-Null "
+            + "}; ";
     }
 
     private ExportCommandResult runNsysStopWithFallback(ToolDetection.DetectionReport report, Path runDir, String sessionName, Path stdout, Path stderr) {
@@ -1301,6 +1392,242 @@ public final class DiagnoseOrchestrator {
     }
 
     private record ExportTask(String name, CompletableFuture<ExportCommandResult> future) {
+    }
+
+    private static final class ElevatedHelper {
+        private final Path rootDir;
+        private final Path commandsDir;
+        private final Path resultsDir;
+        private final Path readyFile;
+        private final Path shutdownFile;
+        private final AtomicInteger nextId = new AtomicInteger(1);
+        private volatile boolean ready;
+
+        private ElevatedHelper(Path rootDir) {
+            this.rootDir = rootDir;
+            this.commandsDir = rootDir.resolve("commands");
+            this.resultsDir = rootDir.resolve("results");
+            this.readyFile = rootDir.resolve("ready.flag");
+            this.shutdownFile = rootDir.resolve("shutdown.flag");
+        }
+
+        static ElevatedHelper start(Path helperDir, Path launchStdout, Path launchStderr) throws Exception {
+            ElevatedHelper helper = new ElevatedHelper(helperDir);
+            Files.createDirectories(helper.rootDir);
+            Files.createDirectories(helper.commandsDir);
+            Files.createDirectories(helper.resultsDir);
+            Files.deleteIfExists(helper.readyFile);
+            Files.deleteIfExists(helper.shutdownFile);
+
+            Path helperScript = helper.rootDir.resolve("helper.ps1");
+            Files.writeString(helperScript, helperScriptBody(helper.rootDir), StandardCharsets.UTF_8);
+
+            String launcherScript =
+                "$ErrorActionPreference='Stop'; " +
+                "$p=Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','" + psEscape(helperScript.toAbsolutePath().toString()) + "') -Verb RunAs -PassThru; " +
+                "if ($null -eq $p) { exit 1 }; exit 0";
+            List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", launcherScript);
+            ProcessRunner.ProcessResult launch = ProcessRunner.run(cmd, helper.rootDir, launchStdout, launchStderr, Duration.ofSeconds(20), false);
+            if (launch.timedOut() || launch.exitCode() != 0) {
+                return null;
+            }
+
+            long deadline = System.currentTimeMillis() + 30_000L;
+            while (System.currentTimeMillis() < deadline) {
+                if (Files.exists(helper.readyFile)) {
+                    helper.ready = true;
+                    return helper;
+                }
+                Thread.sleep(200L);
+            }
+            return null;
+        }
+
+        boolean isReady() {
+            return ready;
+        }
+
+        CommandResult runCommand(String exe, List<String> args, String workDir, String stdout, String stderr, long timeoutMs) {
+            long start = System.currentTimeMillis();
+            if (!ready) {
+                return new CommandResult(-1, false, 0L, "helper_not_ready");
+            }
+            int id = nextId.getAndIncrement();
+            Path commandFile = commandsDir.resolve(String.format("%06d.json", id));
+            Path resultFile = resultsDir.resolve(String.format("%06d.json", id));
+            try {
+                Files.deleteIfExists(resultFile);
+                String payload = commandJson(exe, args, workDir, stdout, stderr, timeoutMs);
+                Files.writeString(commandFile, payload, StandardCharsets.UTF_8);
+
+                long deadline = System.currentTimeMillis() + timeoutMs + 10_000L;
+                while (System.currentTimeMillis() < deadline) {
+                    if (Files.exists(resultFile)) {
+                        String text = Files.readString(resultFile, StandardCharsets.UTF_8);
+                        int exitCode = parseIntField(text, "exitCode", -1);
+                        boolean timedOut = parseBoolField(text, "timedOut", false);
+                        String error = parseStringField(text, "error", "");
+                        return new CommandResult(exitCode, timedOut, System.currentTimeMillis() - start, error);
+                    }
+                    Thread.sleep(100L);
+                }
+                return new CommandResult(-1, true, System.currentTimeMillis() - start, "helper_result_timeout");
+            } catch (Exception e) {
+                return new CommandResult(-1, false, System.currentTimeMillis() - start, "helper_error:" + e.getMessage());
+            } finally {
+                try {
+                    Files.deleteIfExists(commandFile);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        void shutdown() {
+            try {
+                Files.writeString(shutdownFile, "shutdown", StandardCharsets.UTF_8);
+            } catch (Exception ignored) {
+            }
+            ready = false;
+        }
+
+        private static String commandJson(String exe, List<String> args, String workDir, String stdout, String stderr, long timeoutMs) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append("\"exe\":\"").append(jsonEscape(exe)).append("\",");
+            sb.append("\"args\":[");
+            for (int i = 0; i < args.size(); i++) {
+                sb.append("\"").append(jsonEscape(args.get(i))).append("\"");
+                if (i + 1 < args.size()) {
+                    sb.append(",");
+                }
+            }
+            sb.append("],");
+            sb.append("\"workDir\":\"").append(jsonEscape(workDir)).append("\",");
+            sb.append("\"stdout\":\"").append(jsonEscape(stdout)).append("\",");
+            sb.append("\"stderr\":\"").append(jsonEscape(stderr)).append("\",");
+            sb.append("\"timeoutMs\":").append(timeoutMs);
+            sb.append("}");
+            return sb.toString();
+        }
+
+        /**
+         * Generates the elevated helper PowerShell script. CRITICAL: In elevated Start-Process -PassThru
+         * contexts, $p.ExitCode is often null even after WaitForExit. We must infer from stderr:
+         * - Hex code (0xNNNNNNNN) → use that as signed exit code
+         * - Empty/null stderr → success (0)
+         * - Other text → generic failure (1)
+         * NEVER call .Substring() or other methods on $stderrText directly: Get-Content -Raw returns
+         * $null for empty files, which throws "You cannot call a method on a null-valued expression"
+         * and corrupts the result. Use [string]::IsNullOrWhiteSpace() and -match only.
+         */
+        private static String helperScriptBody(Path rootDir) {
+            String root = psEscape(rootDir.toAbsolutePath().toString());
+            return
+                "$ErrorActionPreference='Continue'\n" +
+                "$root='" + root + "'\n" +
+                "$cmdDir=Join-Path $root 'commands'\n" +
+                "$resDir=Join-Path $root 'results'\n" +
+                "$ready=Join-Path $root 'ready.flag'\n" +
+                "$shutdown=Join-Path $root 'shutdown.flag'\n" +
+                "$log=Join-Path $root 'helper.log'\n" +
+                "New-Item -ItemType Directory -Force -Path $cmdDir,$resDir | Out-Null\n" +
+                "$sig='using System;using System.Runtime.InteropServices;public static class InsigniaConsoleMode{[DllImport(\"\"kernel32.dll\"\")] public static extern IntPtr GetStdHandle(int nStdHandle);[DllImport(\"\"kernel32.dll\"\")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out int lpMode);[DllImport(\"\"kernel32.dll\"\")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);}';\n" +
+                "try { Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue | Out-Null } catch {}\n" +
+                "try { $h=[InsigniaConsoleMode]::GetStdHandle(-10); $m=0; if([InsigniaConsoleMode]::GetConsoleMode($h,[ref]$m)) { $m = ($m -band (-bnot 0x40)) -bor 0x80; [InsigniaConsoleMode]::SetConsoleMode($h,$m) | Out-Null } } catch {}\n" +
+                "Set-Content -Path $ready -Value 'ready' -Encoding UTF8\n" +
+                "Add-Content -Path $log -Value (\"[{0}] helper ready\" -f (Get-Date).ToString('o'))\n" +
+                "while (-not (Test-Path $shutdown)) {\n" +
+                "  $files = Get-ChildItem -Path $cmdDir -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name\n" +
+                "  foreach ($f in $files) {\n" +
+                "    $exitCode = -1; $timedOut = $false; $err = ''\n" +
+                "    try {\n" +
+                "      $cmd = Get-Content -Raw -Path $f.FullName | ConvertFrom-Json\n" +
+                "      $argList = @(); foreach ($a in $cmd.args) { $argList += [string]$a }\n" +
+                "      Add-Content -Path $log -Value (\"[{0}] run {1} {2}\" -f (Get-Date).ToString('o'), [string]$cmd.exe, ($argList -join ' '))\n" +
+                "      $p = Start-Process -FilePath ([string]$cmd.exe) -ArgumentList $argList -WorkingDirectory ([string]$cmd.workDir) -RedirectStandardOutput ([string]$cmd.stdout) -RedirectStandardError ([string]$cmd.stderr) -PassThru\n" +
+                "      $ok = $p.WaitForExit([int]$cmd.timeoutMs)\n" +
+                "      if (-not $ok) { try { $p.Kill() } catch {}; $timedOut = $true; $exitCode = -1 } else { " +
+                "        $p.WaitForExit(); " +
+                "        $p.Refresh(); " +
+                "        $code = $p.ExitCode; " +
+                "        if ($null -ne $code) { " +
+                "          $exitCode = [int]$code; " +
+                "        } else { " +
+                "          $stderrText = ''; " +
+                "          try { if (Test-Path ([string]$cmd.stderr)) { $stderrText = Get-Content -Raw -Path ([string]$cmd.stderr) } } catch {}; " +
+                "          if ($stderrText -match '0x([0-9A-Fa-f]{8})') { " +
+                "            $u = [Convert]::ToUInt32($matches[1], 16); " +
+                "            $exitCode = [BitConverter]::ToInt32([BitConverter]::GetBytes($u), 0); " +
+                "          } elseif ([string]::IsNullOrWhiteSpace($stderrText)) { " +
+                "            $exitCode = 0; " +
+                "          } else { " +
+                "            $exitCode = 1; " +
+                "          } " +
+                "        } " +
+                "      }\n" +
+                "    } catch { $err = $_.ToString() }\n" +
+                "    Add-Content -Path $log -Value (\"[{0}] done {1} exit={2} timedOut={3} err={4}\" -f (Get-Date).ToString('o'), $f.BaseName, $exitCode, $timedOut, $err)\n" +
+                "    $out = @{ exitCode = $exitCode; timedOut = $timedOut; error = $err } | ConvertTo-Json -Compress\n" +
+                "    $resPath = Join-Path $resDir ($f.BaseName + '.json')\n" +
+                "    Set-Content -Path $resPath -Value $out -Encoding UTF8\n" +
+                "    Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue\n" +
+                "  }\n" +
+                "  Start-Sleep -Milliseconds 100\n" +
+                "}\n";
+        }
+
+        private static int parseIntField(String json, String field, int fallback) {
+            try {
+                Pattern p = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*(-?\\d+)");
+                Matcher m = p.matcher(json);
+                if (m.find()) {
+                    return Integer.parseInt(m.group(1));
+                }
+            } catch (Exception ignored) {
+            }
+            return fallback;
+        }
+
+        private static boolean parseBoolField(String json, String field, boolean fallback) {
+            try {
+                Pattern p = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*(true|false)");
+                Matcher m = p.matcher(json);
+                if (m.find()) {
+                    return "true".equalsIgnoreCase(m.group(1));
+                }
+            } catch (Exception ignored) {
+            }
+            return fallback;
+        }
+
+        private static String parseStringField(String json, String field, String fallback) {
+            try {
+                Pattern p = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*\"(.*?)\"");
+                Matcher m = p.matcher(json);
+                if (m.find()) {
+                    return m.group(1);
+                }
+            } catch (Exception ignored) {
+            }
+            return fallback;
+        }
+
+        private static String jsonEscape(String s) {
+            if (s == null) {
+                return "";
+            }
+            return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        }
+
+        private static String psEscape(String value) {
+            if (value == null) {
+                return "";
+            }
+            return value.replace("'", "''");
+        }
+
+        private record CommandResult(int exitCode, boolean timedOut, long elapsedMs, String error) {
+        }
     }
 
     private enum NsysStartMode {

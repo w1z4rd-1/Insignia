@@ -143,11 +143,17 @@ public final class BundleWriter {
 
     public static void includeFullModeFiles(Path runDir, List<String> notes) {
         Path gameDir = FabricLoader.getInstance().getGameDir();
-        copyIfExists(gameDir.resolve("logs").resolve("latest.log"), runDir.resolve("latest.log"), notes);
         copyIfExists(gameDir.resolve("options.txt"), runDir.resolve("options.txt"), notes);
         copyIfExists(FabricLoader.getInstance().getConfigDir().resolve("sodium-options.json"), runDir.resolve("sodium-options.json"), notes);
         copyIfExists(FabricLoader.getInstance().getConfigDir().resolve("sodium-extra-options.json"), runDir.resolve("sodium-extra-options.json"), notes);
         copyIfExists(FabricLoader.getInstance().getConfigDir().resolve("lithium.properties"), runDir.resolve("lithium.properties"), notes);
+        try {
+            Thread.sleep(250L);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        // Copy latest.log last so it includes the newest diagnose status lines.
+        copyIfExists(gameDir.resolve("logs").resolve("latest.log"), runDir.resolve("latest.log"), notes);
     }
 
     private static void copyIfExists(Path from, Path to, List<String> notes) {
@@ -157,6 +163,7 @@ public final class BundleWriter {
             }
             Files.copy(from, to, StandardCopyOption.REPLACE_EXISTING);
             notes.add("Included file: " + from.getFileName());
+            TaggerMod.LOGGER.info("[Diagnose][Bundle] Included file {}", from.getFileName());
         } catch (Exception e) {
             notes.add("Failed to include " + from + ": " + e.getMessage());
             TaggerMod.LOGGER.warn("[Diagnose][Bundle] Failed to include {}", from, e);

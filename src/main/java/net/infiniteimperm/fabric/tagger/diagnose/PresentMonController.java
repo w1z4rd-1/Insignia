@@ -95,7 +95,6 @@ public final class PresentMonController {
     }
 
     public void stop() throws Exception {
-        TaggerMod.LOGGER.info("[Diagnose][PresentMon] Stopping PresentMon");
         if (elevatedTimedMode) {
             waitForCsvReady(Duration.ofSeconds(20));
             ensureCsvFromFallback();
