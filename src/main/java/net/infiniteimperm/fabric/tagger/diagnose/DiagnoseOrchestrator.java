@@ -261,7 +261,8 @@ public final class DiagnoseOrchestrator {
                 + ", wpaexporter=" + (report.wpaExporter != null && report.wpaExporter.found)
                 + ", tracerpt=" + (report.tracerpt != null && report.tracerpt.found)
                 + ", nvidia-smi=" + (report.nvidiaSmi != null && report.nvidiaSmi.found));
-            nsysMode = startOptionalNsys(report, runDir, nsysStartLog, notes, nsysSession);
+            nsysMode = startOptionalNsys(report, runDir, nsysStartLog, notes, nsysSession, captureSeconds);
+            boolean nsysWasTimedProfile = (nsysMode == NsysStartMode.TIMED_PROFILE);
             wprStatus = startOptionalWpr(report, runDir, wprStartLog, notes);
             if (state != null) {
                 state.nsysStartedByUs = nsysMode == NsysStartMode.SESSION;
@@ -276,6 +277,9 @@ public final class DiagnoseOrchestrator {
 
             long started = System.currentTimeMillis();
             long captureMs = captureSeconds * 1000L;
+            // Deadline by which the timed-profile nsys process should have written its .nsys-rep.
+            // nsys --duration is set to captureSeconds+15, so it finishes ~15s after capture ends.
+            long nsysTimedDeadline = started + (long)(captureSeconds + 15) * 1000L;
             while (System.currentTimeMillis() - started < captureMs) {
                 Thread.sleep(250L);
             }
@@ -332,6 +336,21 @@ public final class DiagnoseOrchestrator {
             announceExportIfExists("WPR trace", runDir.resolve("trace.etl"));
             announceExportIfExists("WPA export", runDir.resolve("wpa_exports"));
             announceExportIfExists("tracerpt export", runDir.resolve("trace_raw.csv"));
+            if (nsysWasTimedProfile) {
+                Path nsysRep = runDir.resolve("nsys-report.nsys-rep");
+                long nsysWaitDeadline = nsysTimedDeadline + 5_000L; // 5s grace past expected finish
+                log(latestLog, "Waiting for nsys timed profile report (deadline in " + Math.max(0, nsysWaitDeadline - System.currentTimeMillis()) + "ms)...");
+                while (!Files.exists(nsysRep) && System.currentTimeMillis() < nsysWaitDeadline) {
+                    Thread.sleep(500L);
+                }
+                if (Files.exists(nsysRep)) {
+                    notes.add("nsys timed profile report appeared before bundle export.");
+                    log(latestLog, "nsys-report.nsys-rep found.");
+                } else {
+                    notes.add("nsys timed profile: report not found within wait window; profile may still be running.");
+                    log(latestLog, "nsys-report.nsys-rep not found after wait; proceeding.");
+                }
+            }
             log(latestLog, "Collecting external Nsight reports if present...");
             NsysExternalCollector.collectPossibleReports(runDir, jfr.startWall(), notes);
             announceExportIfExists("Nsight Systems", runDir.resolve("nsys-report.nsys-rep"));
@@ -453,7 +472,7 @@ public final class DiagnoseOrchestrator {
         }
     }
 
-    private NsysStartMode startOptionalNsys(ToolDetection.DetectionReport report, Path runDir, Path logBaseFile, List<String> notes, String sessionName) {
+    private NsysStartMode startOptionalNsys(ToolDetection.DetectionReport report, Path runDir, Path logBaseFile, List<String> notes, String sessionName, int captureSeconds) {
         if (report.nsys == null || !report.nsys.found || report.nsys.path == null) {
             return NsysStartMode.NOT_STARTED;
         }
@@ -487,7 +506,7 @@ public final class DiagnoseOrchestrator {
                 ExportCommandResult elevated = runNsysElevated(report, runDir, baseArgs, replaceSuffix(logBaseFile, "-uac.stdout.log"), replaceSuffix(logBaseFile, "-uac.stderr.log"));
                 if (!elevated.success()) {
                     notes.add("nsys UAC fallback failed with exitCode=" + elevated.exitCode() + " timedOut=" + elevated.timedOut());
-                    if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes)) {
+                    if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes, captureSeconds)) {
                         announceStarted("Nsight Systems");
                         return NsysStartMode.TIMED_PROFILE;
                     }
@@ -515,19 +534,19 @@ public final class DiagnoseOrchestrator {
                     return NsysStartMode.SESSION;
                 }
                 notes.add("nsys UAC fallback failed with exitCode=" + elevated.exitCode() + " timedOut=" + elevated.timedOut());
-                if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes)) {
-                    announceStarted("Nsight Systems");
-                    return NsysStartMode.TIMED_PROFILE;
+                if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes, captureSeconds)) {
+                        announceStarted("Nsight Systems");
+                        return NsysStartMode.TIMED_PROFILE;
+                    }
+                    return NsysStartMode.NOT_STARTED;
                 }
-                return NsysStartMode.NOT_STARTED;
-            }
-            notes.add("Attempted nsys session start.");
+                notes.add("Attempted nsys session start.");
             announceStarted("Nsight Systems");
             return NsysStartMode.SESSION;
         } catch (Exception e) {
             notes.add("nsys capture failed: " + e.getMessage());
             TaggerMod.LOGGER.warn("[Diagnose] nsys capture failed", e);
-            if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes)) {
+            if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes, captureSeconds)) {
                 announceStarted("Nsight Systems");
                 return NsysStartMode.TIMED_PROFILE;
             }
@@ -551,20 +570,23 @@ public final class DiagnoseOrchestrator {
         }
     }
 
-    private boolean launchNsysTimedProfileConsole(ToolDetection.DetectionReport report, Path runDir, Path logBaseFile, List<String> notes) {
+    private boolean launchNsysTimedProfileConsole(ToolDetection.DetectionReport report, Path runDir, Path logBaseFile, List<String> notes, int captureSeconds) {
         try {
             Path stdout = replaceSuffix(logBaseFile, "-profile-console.stdout.log");
             Path stderr = replaceSuffix(logBaseFile, "-profile-console.stderr.log");
             String exe = report.nsys.path.toAbsolutePath().toString().replace("'", "''");
             String out = runDir.resolve("nsys-report").toAbsolutePath().toString().replace("'", "''");
+            // Profile duration is tied to the requested diagnose window plus a small buffer so the
+            // .nsys-rep is written before (or shortly after) bundle export begins.
+            int nsysDuration = captureSeconds + 15;
             String script =
                 "$ErrorActionPreference='Stop'; " +
-                "$a=@('profile','--trace=none','--sample=none','--cpuctxsw=none','--duration','115','--force-overwrite=true','-o','" + out + "','cmd','/c','timeout /t 116 >nul'); " +
+                "$a=@('profile','--trace=none','--sample=none','--cpuctxsw=none','--duration','" + nsysDuration + "','--force-overwrite=true','-o','" + out + "','cmd','/c','timeout /t " + (nsysDuration + 1) + " >nul'); " +
                 "$p=Start-Process -FilePath '" + exe + "' -ArgumentList $a -WindowStyle Normal -PassThru; " +
                 "if ($null -eq $p) { exit 1 }; exit 0";
             List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", script);
             ProcessRunner.ProcessResult result = ProcessRunner.run(cmd, runDir, stdout, stderr, Duration.ofSeconds(20), false);
-            notes.add("nsys timed profile console fallback exitCode=" + result.exitCode() + " timedOut=" + result.timedOut());
+            notes.add("nsys timed profile console fallback exitCode=" + result.exitCode() + " timedOut=" + result.timedOut() + " duration=" + nsysDuration + "s");
             return !result.timedOut() && result.exitCode() == 0;
         } catch (Exception e) {
             notes.add("nsys timed profile console fallback failed: " + e.getMessage());
@@ -1035,34 +1057,19 @@ public final class DiagnoseOrchestrator {
                         ProcessRunner.ProcessResult retry = runWprElevatedStartCommand(report, runDir, retryStdout, retryStderr);
                         notes.add("WPR UAC retry exitCode=" + retry.exitCode() + " timedOut=" + retry.timedOut());
                         if (!retry.timedOut() && retry.exitCode() == 0) {
-                            boolean activeAfterRetry = isWprRecordingInProgress(report, runDir);
-                            notes.add("WPR status after UAC retry: recording=" + activeAfterRetry);
-                            return activeAfterRetry;
+                            // Trust exit code; non-elevated wpr -status cannot see elevated sessions.
+                            notes.add("WPR UAC retry after already-running succeeded; trusting exit code.");
+                            return true;
                         }
                     }
                     return false;
                 }
                 return false;
             }
-            boolean active = isWprRecordingInProgress(report, runDir);
-            notes.add("WPR status after UAC start: recording=" + active);
-            if (active) {
-                return true;
-            }
-            notes.add("WPR not active after UAC start; attempting elevated cancel + retry.");
-            if (!runWprCancel(report, runDir, notes, true)) {
-                return false;
-            }
-            Path retryStdout = runDir.resolve("logs").resolve("wpr-start-uac-retry.stdout.log");
-            Path retryStderr = runDir.resolve("logs").resolve("wpr-start-uac-retry.stderr.log");
-            ProcessRunner.ProcessResult retry = runWprElevatedStartCommand(report, runDir, retryStdout, retryStderr);
-            notes.add("WPR UAC retry exitCode=" + retry.exitCode() + " timedOut=" + retry.timedOut());
-            if (retry.timedOut() || retry.exitCode() != 0) {
-                return false;
-            }
-            boolean activeAfterRetry = isWprRecordingInProgress(report, runDir);
-            notes.add("WPR status after UAC retry: recording=" + activeAfterRetry);
-            return activeAfterRetry;
+            // Elevated start succeeded (exit 0). Non-elevated wpr -status cannot see elevated
+            // sessions, so skip the status check and trust the exit code directly.
+            notes.add("WPR elevated start succeeded; trusting exit code.");
+            return true;
         } catch (Exception e) {
             notes.add("WPR UAC fallback failed: " + e.getMessage());
             return false;
