@@ -6,8 +6,8 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.infiniteimperm.fabric.tagger.diagnose.DiagnoseOrchestrator;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.text.Text;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -31,7 +31,6 @@ public class TaggerMod implements ClientModInitializer {
             QueueDurabilityChecker.resetConfirmation(); // Reset confirmation timeout
             GhostTotemDetector.tick(client);
             KitDetector.tick(); // Add KitDetector tick
-            PlayerHighlightTracker.tick(client); // Track player highlight states
         });
         
         // Register event for processing chat messages
@@ -51,9 +50,10 @@ public class TaggerMod implements ClientModInitializer {
                 int screenHeight = MinecraftClient.getInstance().getWindow().getScaledHeight();
                 drawContext.fill(0, 0, screenWidth, screenHeight, 0x40FF0000); // Draw overlay directly
             }
+            DiagnoseOrchestrator.onHudFrameBoundary();
         });
         
-        // Register the /gd commands
+        // Register client commands
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             // Register /insignia command to open config GUI
             dispatcher.register(ClientCommandManager.literal("insignia")
@@ -63,29 +63,8 @@ public class TaggerMod implements ClientModInitializer {
                     return 1;
                 })
             );
-            
-            dispatcher.register(ClientCommandManager.literal("gd")
-                .then(ClientCommandManager.literal("macro")
-                    .executes(context -> {
-                        GhostTotemDetector.toggleMacroMode();
-                        return 1;
-                    })
-                )
-                .then(ClientCommandManager.literal("clipboard")
-                    .executes(context -> {
-                        GhostTotemDetector.toggleClipboardMode();
-                        return 1;
-                    })
-                )
-                .executes(context -> {
-                    context.getSource().sendFeedback(Text.literal(
-                        "§6Ghost Detector Commands:\n" +
-                        "§e/gd macro §7- Toggle chat macro mode (check your server's rules!)\n" +
-                        "§e/gd clipboard §7- Toggle clipboard mode (copy to clipboard)"
-                    ));
-                    return 1;
-                })
-            );
+
+            DiagnoseCommand.register(dispatcher);
         });
     }
 }

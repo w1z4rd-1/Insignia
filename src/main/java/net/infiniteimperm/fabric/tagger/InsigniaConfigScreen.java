@@ -27,12 +27,6 @@ public class InsigniaConfigScreen {
             .setSaveConsumer(newValue -> config.ghostTotemEnabled = newValue)
             .build());
         
-        ghostTotem.addEntry(entryBuilder.startBooleanToggle(Text.literal("Macro Mode"), config.ghostTotemMacroMode)
-            .setDefaultValue(false)
-            .setTooltip(Text.literal("Automatically send ghost detection messages to chat (check server rules!)"))
-            .setSaveConsumer(newValue -> config.ghostTotemMacroMode = newValue)
-            .build());
-        
         ghostTotem.addEntry(entryBuilder.startBooleanToggle(Text.literal("Clipboard Mode"), config.ghostTotemClipboardMode)
             .setDefaultValue(true)
             .setTooltip(Text.literal("Copy ghost detection messages to clipboard"))
@@ -82,73 +76,6 @@ public class InsigniaConfigScreen {
             .setDefaultValue(0x40FF0000)
             .setTooltip(Text.literal("Color of the totem warning overlay"))
             .setSaveConsumer(newValue -> config.totemWarningColor = newValue)
-            .build());
-        
-        // Damage Flash Category
-        ConfigCategory damageFlash = builder.getOrCreateCategory(Text.literal("Damage Flash"));
-        
-        damageFlash.addEntry(entryBuilder.startBooleanToggle(Text.literal("Enable Full Model Flash"), config.damageFlashEnabled)
-            .setDefaultValue(true)
-            .setTooltip(Text.literal("Flash entire player model (including armor and items) when damaged"))
-            .setSaveConsumer(newValue -> config.damageFlashEnabled = newValue)
-            .build());
-        
-        damageFlash.addEntry(entryBuilder.startAlphaColorField(Text.literal("Flash Color"), config.damageFlashColor)
-            .setDefaultValue(0xFFFF0000)
-            .setTooltip(Text.literal("Color of the damage flash"))
-            .setSaveConsumer(newValue -> config.damageFlashColor = newValue)
-            .build());
-        
-        damageFlash.addEntry(entryBuilder.startIntSlider(Text.literal("Flash Duration (ms)"), config.damageFlashDuration, 100, 1000)
-            .setDefaultValue(400)
-            .setTooltip(Text.literal("How long the damage flash lasts in milliseconds"))
-            .setSaveConsumer(newValue -> config.damageFlashDuration = newValue)
-            .build());
-        
-        // Totem Highlighting Category
-        ConfigCategory totemHighlight = builder.getOrCreateCategory(Text.literal("Totem Highlighting"));
-        
-        totemHighlight.addEntry(entryBuilder.startBooleanToggle(Text.literal("Enable Totem Highlighting"), config.totemHighlightEnabled)
-            .setDefaultValue(true)
-            .setTooltip(Text.literal("Highlight players based on their totem status"))
-            .setSaveConsumer(newValue -> config.totemHighlightEnabled = newValue)
-            .build());
-        
-        totemHighlight.addEntry(entryBuilder.startBooleanToggle(Text.literal("Enable No-Totem Highlighting"), config.noTotemHighlightEnabled)
-            .setDefaultValue(true)
-            .setTooltip(Text.literal("Highlight players when they run out of totems"))
-            .setSaveConsumer(newValue -> config.noTotemHighlightEnabled = newValue)
-            .build());
-        
-        totemHighlight.addEntry(entryBuilder.startAlphaColorField(Text.literal("Has Totem Color"), config.hasTotemColor)
-            .setDefaultValue(0xFF00FF00)
-            .setTooltip(Text.literal("Color when player is holding totems"))
-            .setSaveConsumer(newValue -> config.hasTotemColor = newValue)
-            .build());
-        
-        totemHighlight.addEntry(entryBuilder.startAlphaColorField(Text.literal("No Totem Color"), config.noTotemColor)
-            .setDefaultValue(0xFFFF0000)
-            .setTooltip(Text.literal("Color when player runs out of totems"))
-            .setSaveConsumer(newValue -> config.noTotemColor = newValue)
-            .build());
-        
-        totemHighlight.addEntry(entryBuilder.startIntSlider(Text.literal("No-Totem Fade Duration (ms)"), config.noTotemFadeDuration, 1000, 10000)
-            .setDefaultValue(5000)
-            .setTooltip(Text.literal("How long the no-totem highlight lasts before fading"))
-            .setSaveConsumer(newValue -> config.noTotemFadeDuration = newValue)
-            .build());
-        
-        totemHighlight.addEntry(entryBuilder.startEnumSelector(Text.literal("Color Priority"), InsigniaConfig.ColorPriority.class, config.colorPriority)
-            .setDefaultValue(InsigniaConfig.ColorPriority.DAMAGE_OVERRIDES)
-            .setTooltip(Text.literal("How colors interact when both damage and no-totem are active"))
-            .setEnumNameProvider(priority -> Text.literal(((InsigniaConfig.ColorPriority)priority).getDisplayName()))
-            .setSaveConsumer(newValue -> config.colorPriority = newValue)
-            .build());
-        
-        totemHighlight.addEntry(entryBuilder.startAlphaColorField(Text.literal("Damage + No-Totem Color"), config.damageNoTotemColor)
-            .setDefaultValue(0xFFFF00FF)
-            .setTooltip(Text.literal("Color when player is damaged AND has no totems (if using Combined Color mode)"))
-            .setSaveConsumer(newValue -> config.damageNoTotemColor = newValue)
             .build());
         
         return builder.build();

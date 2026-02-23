@@ -91,7 +91,6 @@ public class QueueDurabilityChecker {
         boolean allArmorFresh = true;
         float totalDurabilityPercent = 0;
         int armorPieces = 0;
-        StringBuilder details = new StringBuilder();
         
         String[] slotNames = {"Boots", "Leggings", "Chestplate", "Helmet"};
         
@@ -112,9 +111,6 @@ public class QueueDurabilityChecker {
                     allArmorFresh = false;
                 }
                 
-                details.append(String.format("%s: %d%% ", 
-                    slotNames[i], Math.round(durabilityPercent * 100)));
-                
                 TaggerMod.LOGGER.info("[QueueDurabilityChecker] {}: {}% durability ({}/{})", 
                     slotNames[i], Math.round(durabilityPercent * 100), remainingDurability, maxDamage);
             }
@@ -122,7 +118,7 @@ public class QueueDurabilityChecker {
         
         float averageDurabilityPercent = armorPieces > 0 ? totalDurabilityPercent / armorPieces : 1.0f;
         
-        return new ArmorDurabilityResult(allArmorFresh, averageDurabilityPercent, details.toString().trim());
+        return new ArmorDurabilityResult(allArmorFresh, averageDurabilityPercent);
     }
     
     /**
@@ -149,12 +145,10 @@ public class QueueDurabilityChecker {
     private static class ArmorDurabilityResult {
         final boolean allArmorFresh;
         final float averageDurabilityPercent;
-        final String durabilityDetails;
         
-        ArmorDurabilityResult(boolean allArmorFresh, float averageDurabilityPercent, String durabilityDetails) {
+        ArmorDurabilityResult(boolean allArmorFresh, float averageDurabilityPercent) {
             this.allArmorFresh = allArmorFresh;
             this.averageDurabilityPercent = averageDurabilityPercent;
-            this.durabilityDetails = durabilityDetails;
         }
     }
 }

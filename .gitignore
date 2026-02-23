@@ -31,6 +31,9 @@ bin/
 # fabric
 
 run/
+logs/
+test-results/
+temp/
 
 
 # Compiled class file

@@ -7,15 +7,12 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.util.math.Vec3d;
-import net.minecraft.util.math.MathHelper;
 
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.Random;
 
 public class KitEffectRenderer {
     
     private static final ConcurrentHashMap<String, EffectData> activeEffects = new ConcurrentHashMap<>();
-    private static final Random random = new Random();
     
     /**
      * Strike a player with lightning for loading a kit

@@ -50,10 +50,6 @@ public class KitDetector {
             }
         }
         
-        // Debug: Log when messages don't match any pattern
-        if (TaggerMod.DEBUG_MODE && message.contains("kit")) {
-            TaggerMod.LOGGER.info("[KitDetector] Message contains 'kit' but doesn't match any pattern: '{}'", message);
-        }
     }
     
     /**
