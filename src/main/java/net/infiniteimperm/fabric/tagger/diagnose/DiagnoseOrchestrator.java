@@ -2,6 +2,7 @@ package net.infiniteimperm.fabric.tagger.diagnose;
 
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.loader.api.FabricLoader;
+import net.infiniteimperm.fabric.tagger.InsigniaConfig;
 import net.infiniteimperm.fabric.tagger.TaggerMod;
 import net.minecraft.client.MinecraftClient;
 
@@ -26,11 +27,29 @@ import java.net.http.HttpResponse;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Collections;
 
 public final class DiagnoseOrchestrator {
     public enum Mode {
-        PRIVACY,
-        FULL
+        NORMAL,
+        FULL,
+        CUSTOM
+    }
+
+    private static final class CapturePlan {
+        boolean presentMon;
+        boolean jfr;
+        boolean perfCounters;
+        boolean typeperf;
+        boolean processContention;
+        boolean nvidiaSmi;
+        boolean spark;
+        boolean nsys;
+        boolean wpr;
+
+        boolean anyEnabled() {
+            return presentMon || jfr || perfCounters || typeperf || processContention || nvidiaSmi || spark || nsys || wpr;
+        }
     }
 
     private static final DiagnoseOrchestrator INSTANCE = new DiagnoseOrchestrator();
@@ -39,7 +58,11 @@ public final class DiagnoseOrchestrator {
     private static final long EXPORT_WAIT_NOTICE_MS = 30_000L;
     private static final long EXPORT_TIMEOUT_MS = 60_000L;
     private static final String ACTIVE_STATE_FILE = "active-session.properties";
+    private static final long SHARE_ZIP_MAX_BYTES = 500L * 1024L * 1024L;
+    private static final int SHARE_ZIP_MAX_PARTS = 3;
     private static final Pattern SPARK_URL_PATTERN = Pattern.compile("(https://spark\\.lucko\\.me/[A-Za-z0-9]+)");
+    private static final int SPARK_FETCH_RETRIES = 3;
+    private static final long SPARK_FETCH_RETRY_BACKOFF_MS = 1500L;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "insignia-diagnose");
@@ -50,6 +73,9 @@ public final class DiagnoseOrchestrator {
     private final AtomicBoolean active = new AtomicBoolean(false);
     private volatile Path activeRunDir;
     private volatile ElevatedHelper elevatedHelper;
+    private volatile Instant sparkDispatchAt;
+    private volatile String sparkUrlFromChat;
+    private volatile Instant sparkUrlCapturedAt;
 
     private DiagnoseOrchestrator() {
     }
@@ -60,6 +86,80 @@ public final class DiagnoseOrchestrator {
 
     public static void onHudFrameBoundary() {
         JfrController.onHudFrameBoundary();
+    }
+
+    public static void onHudFrameStart() {
+        JfrController.onHudFrameStart();
+    }
+
+    public static void onHudFrameEnd() {
+        JfrController.onHudFrameEnd();
+    }
+
+    public static void onWorldFrameStart() {
+        JfrController.onWorldFrameStart();
+    }
+
+    public static void onWorldFrameEnd() {
+        JfrController.onWorldFrameEnd();
+    }
+
+    public static void onPostPhaseDuration(long durationNs) {
+        JfrController.onPostPhaseDuration(durationNs);
+    }
+
+    public static void onWorldTransitionJoin(long durationNs) {
+        JfrController.onWorldTransition(JfrController.transitionJoin(), durationNs);
+    }
+
+    public static void onWorldTransitionLeave(long durationNs) {
+        JfrController.onWorldTransition(JfrController.transitionLeave(), durationNs);
+    }
+
+    public static void onWorldTransitionDimChange(long durationNs) {
+        JfrController.onWorldTransition(JfrController.transitionDimChange(), durationNs);
+    }
+
+    public static void onUserStutterMark(String label) {
+        JfrController.onUserStutterMark(label);
+    }
+
+    public static void onResourceReloadStart() {
+        JfrController.onResourceReload(JfrController.resourceReloadStartPhase(), 0L);
+    }
+
+    public static void onResourceReloadEnd(long durationNs) {
+        JfrController.onResourceReload(JfrController.resourceReloadEndPhase(), durationNs);
+    }
+
+    public void onIncomingGameMessage(String text) {
+        if (!active.get() || text == null || text.isBlank()) {
+            return;
+        }
+        // Ignore unrelated spark URLs unless we actually dispatched a spark profile in this run.
+        if (sparkDispatchAt == null) {
+            return;
+        }
+        Matcher matcher = SPARK_URL_PATTERN.matcher(text);
+        String found = null;
+        while (matcher.find()) {
+            found = matcher.group(1);
+        }
+        if (found == null || found.isBlank()) {
+            return;
+        }
+        sparkUrlFromChat = found;
+        sparkUrlCapturedAt = Instant.now();
+        try {
+            Path run = activeRunDir;
+            if (run != null) {
+                Path out = run.resolve("results").resolve("spark-profile-url.txt");
+                Files.createDirectories(out.getParent());
+                Files.writeString(out, found + System.lineSeparator(), StandardCharsets.UTF_8);
+            }
+        } catch (Exception ignored) {
+        }
+        TaggerMod.LOGGER.info("[Diagnose] Captured spark URL from chat: {}", found);
     }
 
     public void showSetupHelp(FabricClientCommandSource source) {
@@ -115,6 +215,46 @@ public final class DiagnoseOrchestrator {
         }
     }
 
+    private CapturePlan buildCapturePlan(Mode mode) {
+        CapturePlan plan = new CapturePlan();
+        if (mode == Mode.FULL) {
+            plan.presentMon = true;
+            plan.jfr = true;
+            plan.perfCounters = true;
+            plan.typeperf = true;
+            plan.processContention = true;
+            plan.nvidiaSmi = true;
+            plan.spark = true;
+            plan.nsys = true;
+            plan.wpr = true;
+            return plan;
+        }
+        if (mode == Mode.NORMAL) {
+            plan.presentMon = true;
+            plan.jfr = true;
+            plan.perfCounters = true;
+            plan.typeperf = true;
+            plan.processContention = true;
+            plan.nvidiaSmi = true;
+            plan.spark = true;
+            plan.nsys = false;
+            plan.wpr = false;
+            return plan;
+        }
+
+        InsigniaConfig cfg = InsigniaConfig.getInstance();
+        plan.presentMon = cfg.diagnoseCustomPresentMon;
+        plan.jfr = cfg.diagnoseCustomJfr;
+        plan.perfCounters = cfg.diagnoseCustomPerfCounters;
+        plan.typeperf = cfg.diagnoseCustomTypeperf;
+        plan.processContention = cfg.diagnoseCustomProcessContention;
+        plan.nvidiaSmi = cfg.diagnoseCustomNvidiaSmi;
+        plan.spark = cfg.diagnoseCustomSpark;
+        plan.nsys = cfg.diagnoseCustomNsight;
+        plan.wpr = cfg.diagnoseCustomWpr;
+        return plan;
+    }
+
     public void start(Mode mode, FabricClientCommandSource source) {
         start(mode, DEFAULT_CAPTURE_SECONDS, source);
     }
@@ -131,18 +271,24 @@ public final class DiagnoseOrchestrator {
             ChatUi.error("Diagnostics currently supports Windows only.");
             return;
         }
+        CapturePlan plan = buildCapturePlan(mode);
+        if (!plan.anyEnabled()) {
+            ChatUi.error("No profilers enabled for /diagnose " + mode.name().toLowerCase(Locale.ROOT) + ".");
+            ChatUi.hintGray("Open /insignia -> Profiler and enable at least one toggle.");
+            return;
+        }
         ToolDetection.DetectionReport report = ToolDetection.detectAll();
-        if (!report.jfrAvailable) {
+        if (plan.jfr && !report.jfrAvailable) {
             ChatUi.error("Cannot run diagnose: JFR is unavailable in this Java runtime.");
             return;
         }
-        if (report.presentMon == null || !report.presentMon.found) {
+        if (plan.presentMon && (report.presentMon == null || !report.presentMon.found)) {
             ChatUi.error("Cannot run diagnose: PresentMon is missing.");
             ChatUi.hintGray("Install command: winget install --id=Intel.PresentMon.Console -e");
             showSetupHelp(source);
             return;
         }
-        if (report.typeperf == null || !report.typeperf.found) {
+        if (plan.typeperf && (report.typeperf == null || !report.typeperf.found)) {
             ChatUi.error("Cannot run diagnose: typeperf is missing.");
             showSetupHelp(source);
             return;
@@ -153,14 +299,15 @@ public final class DiagnoseOrchestrator {
         }
         int effectiveCaptureSeconds = Math.max(5, captureSeconds);
         ChatUi.info("Starting diagnostics (" + effectiveCaptureSeconds + "s)...");
-        executor.submit(() -> runCapture(mode, report, effectiveCaptureSeconds));
+        executor.submit(() -> runCapture(mode, plan, report, effectiveCaptureSeconds));
     }
 
-    private void runCapture(Mode mode, ToolDetection.DetectionReport report, int captureSeconds) {
-        List<String> notes = new ArrayList<>();
+    private void runCapture(Mode mode, CapturePlan plan, ToolDetection.DetectionReport report, int captureSeconds) {
+        List<String> notes = Collections.synchronizedList(new ArrayList<>());
         List<String> working = new ArrayList<>();
         List<String> failed = new ArrayList<>();
         String sparkUrl = "not available";
+        Path runRootDir = null;
         Path runDir = null;
         PresentMonController presentMon = null;
         JfrController jfr = null;
@@ -183,12 +330,17 @@ public final class DiagnoseOrchestrator {
         ProfilerSessionState.State state = null;
         try {
             elevatedHelper = null;
-            runDir = createRunDir();
-            activeRunDir = runDir;
+            sparkDispatchAt = null;
+            sparkUrlFromChat = null;
+            sparkUrlCapturedAt = null;
+            runRootDir = createRunDir();
+            runDir = runRootDir.resolve("results");
+            Files.createDirectories(runDir);
+            activeRunDir = runRootDir;
             Path logsDir = runDir.resolve("logs");
             Files.createDirectories(logsDir);
             latestLog = runDir.resolve("diagnose.log");
-            stateFile = runDir.getParent().resolve(ACTIVE_STATE_FILE);
+            stateFile = runRootDir.getParent().resolve(ACTIVE_STATE_FILE);
             Path presentStdout = logsDir.resolve("presentmon.stdout.log");
             Path presentStderr = logsDir.resolve("presentmon.stderr.log");
             Path jfrLog = logsDir.resolve("jfr.log");
@@ -202,71 +354,116 @@ public final class DiagnoseOrchestrator {
             Path contentionCsv = runDir.resolve("process_contention.csv");
             Path contentionLog = logsDir.resolve("process_contention.log");
 
-            log(latestLog, "Run started. mode=" + mode + " runDir=" + runDir);
+            log(latestLog, "Run started. mode=" + mode + " runDir=" + runRootDir + " resultsDir=" + runDir);
             recoverStaleSessions(report, runDir, latestLog, stateFile, notes);
 
-            Path presentCsv = runDir.resolve("presentmon.csv");
-            Path recordingJfr = runDir.resolve("recording.jfr");
-            Path badFrames = runDir.resolve("bad_frames.json");
+            Path presentCsv = plan.presentMon ? runDir.resolve("presentmon.csv") : null;
+            Path recordingJfr = plan.jfr ? runDir.resolve("recording.jfr") : null;
+            Path badFrames = (plan.jfr && plan.presentMon) ? runDir.resolve("bad_frames.json") : null;
             Path systemInfo = runDir.resolve("system_info.json");
             Path readme = runDir.resolve("README_ANALYZE.txt");
 
-            presentMon = new PresentMonController(report.presentMon, runDir, presentCsv, presentStdout, presentStderr, captureSeconds);
-            jfr = new JfrController(jfrLog);
-            perfSampler = new PerfCounterSampler(countersCsv, countersLog, 100L);
-            typeperf = new TypeperfController(report.typeperf, runDir, hardwareCountersCsv, typeperfStdout, typeperfStderr);
-            nvidiaSmi = new NvidiaSmiController(report.nvidiaSmi, runDir, nvidiaSmiCsv, nvidiaSmiStderr);
-            contentionSampler = new ProcessContentionSampler(contentionCsv, contentionLog, 1000L, 12);
+            if (plan.presentMon) {
+                presentMon = new PresentMonController(report.presentMon, runDir, presentCsv, presentStdout, presentStderr, captureSeconds);
+            }
+            if (plan.jfr) {
+                jfr = new JfrController(jfrLog);
+            }
+            if (plan.perfCounters) {
+                perfSampler = new PerfCounterSampler(countersCsv, countersLog, 100L);
+            }
+            if (plan.typeperf) {
+                typeperf = new TypeperfController(report.typeperf, runDir, hardwareCountersCsv, typeperfStdout, typeperfStderr);
+            }
+            if (plan.nvidiaSmi) {
+                nvidiaSmi = new NvidiaSmiController(report.nvidiaSmi, runDir, nvidiaSmiCsv, nvidiaSmiStderr);
+            }
+            if (plan.processContention) {
+                contentionSampler = new ProcessContentionSampler(contentionCsv, contentionLog, 1000L, 12);
+            }
             state = new ProfilerSessionState.State();
             state.ownerPid = ProcessHandle.current().pid();
-            state.runDir = runDir.toString();
+            state.runDir = runRootDir.toString();
             state.createdAt = Instant.now().toString();
             ProfilerSessionState.save(stateFile, state);
 
-            clearExistingWprIfRunning(report, runDir, notes);
-
-            log(latestLog, "Starting JFR recording...");
-            jfr.start();
-            announceStarted("JFR");
-            log(latestLog, "Starting PresentMon capture...");
-            presentMon.start();
-            announceStarted("PresentMon");
-            log(latestLog, "Starting perf counter sampler...");
-            perfSampler.start();
-            announceStarted("perf counters");
-            typeperfStarted = typeperf.start(notes);
-            if (!typeperfStarted) {
-                throw new IllegalStateException("typeperf failed to start (required profiler). Check typeperf.stderr.log");
+            if (plan.wpr) {
+                clearExistingWprIfRunning(report, runDir, notes);
             }
-            announceStarted("typeperf");
-            log(latestLog, "Starting process contention sampler...");
-            contentionSampler.start();
-            announceStarted("process contention");
-            nvidiaSmiStarted = nvidiaSmi.start(notes);
-            if (nvidiaSmiStarted) {
-                announceStarted("nvidia-smi");
+
+            if (plan.jfr && jfr != null) {
+                log(latestLog, "Starting JFR recording...");
+                jfr.start();
+                announceStarted("JFR");
+            }
+            if (plan.presentMon && presentMon != null) {
+                log(latestLog, "Starting PresentMon capture...");
+                presentMon.start();
+                announceStarted("PresentMon");
+            }
+            if (plan.perfCounters && perfSampler != null) {
+                log(latestLog, "Starting perf counter sampler...");
+                perfSampler.start();
+                announceStarted("perf counters");
+            }
+            if (plan.typeperf && typeperf != null) {
+                typeperfStarted = typeperf.start(notes);
+                if (!typeperfStarted) {
+                    throw new IllegalStateException("typeperf failed to start (required profiler). Check typeperf.stderr.log");
+                }
+                announceStarted("typeperf");
+            }
+            if (plan.processContention && contentionSampler != null) {
+                log(latestLog, "Starting process contention sampler...");
+                contentionSampler.start();
+                announceStarted("process contention");
+            }
+            if (plan.nvidiaSmi && nvidiaSmi != null) {
+                nvidiaSmiStarted = nvidiaSmi.start(notes);
+                if (nvidiaSmiStarted) {
+                    announceStarted("nvidia-smi");
+                }
             }
             log(latestLog, "Mandatory captures started.");
 
-            if (report.sparkPresent) {
-                sparkDispatchTime = startSparkCapture(logsDir.resolve("spark.log"), notes, captureSeconds);
-            } else {
-                ChatUi.hintGray("to profile the game itself get the mod spark profiler");
-            }
             nsysStartLog = logsDir.resolve("nsys-start.log");
             nsysStopLog = logsDir.resolve("nsys-stop.log");
             wprStartLog = logsDir.resolve("wpr-start.log");
             wprStopLog = logsDir.resolve("wpr-stop.log");
-            nsysSession = "insignia_" + runDir.getFileName();
-            log(latestLog, "Optional tool detection summary: spark=" + report.sparkPresent
+            nsysSession = "insignia_" + runRootDir.getFileName();
+            log(latestLog, "Optional tool detection summary: mode=" + mode + ", plan[spark=" + plan.spark + ",nsys=" + plan.nsys + ",wpr=" + plan.wpr + "] detected[spark=" + report.sparkPresent
                 + ", nsys=" + (report.nsys != null && report.nsys.found)
                 + ", wpr=" + (report.wpr != null && report.wpr.found)
                 + ", wpaexporter=" + (report.wpaExporter != null && report.wpaExporter.found)
                 + ", tracerpt=" + (report.tracerpt != null && report.tracerpt.found)
                 + ", nvidia-smi=" + (report.nvidiaSmi != null && report.nvidiaSmi.found));
-            nsysMode = startOptionalNsys(report, runDir, nsysStartLog, notes, nsysSession, captureSeconds);
+            if ((plan.nsys || plan.wpr) && ((report.nsys != null && report.nsys.found) || (report.wpr != null && report.wpr.found))) {
+                ensureElevatedHelper(runDir, notes);
+            }
+            final Path runDirFinal = runDir;
+            final Path nsysStartLogFinal = nsysStartLog;
+            final Path wprStartLogFinal = wprStartLog;
+            final String nsysSessionFinal = nsysSession;
+            final List<String> notesFinal = notes;
+            CompletableFuture<Instant> sparkFuture;
+            if (plan.spark && report.sparkPresent) {
+                sparkFuture = CompletableFuture.supplyAsync(() -> startSparkCapture(logsDir.resolve("spark.log"), notesFinal, captureSeconds));
+            } else {
+                if (plan.spark) {
+                    ChatUi.hintGray("to profile the game itself get the mod spark profiler");
+                }
+                sparkFuture = CompletableFuture.completedFuture(null);
+            }
+            CompletableFuture<NsysStartMode> nsysFuture = plan.nsys
+                ? CompletableFuture.supplyAsync(() -> startOptionalNsys(report, runDirFinal, nsysStartLogFinal, notesFinal, nsysSessionFinal, captureSeconds))
+                : CompletableFuture.completedFuture(NsysStartMode.NOT_STARTED);
+            CompletableFuture<WprStartStatus> wprFuture = plan.wpr
+                ? CompletableFuture.supplyAsync(() -> startOptionalWpr(report, runDirFinal, wprStartLogFinal, notesFinal))
+                : CompletableFuture.completedFuture(WprStartStatus.NOT_AVAILABLE);
+            sparkDispatchTime = sparkFuture.join();
+            nsysMode = nsysFuture.join();
             boolean nsysWasTimedProfile = (nsysMode == NsysStartMode.TIMED_PROFILE);
-            wprStatus = startOptionalWpr(report, runDir, wprStartLog, notes);
+            wprStatus = wprFuture.join();
             if (state != null) {
                 state.nsysStartedByUs = nsysMode == NsysStartMode.SESSION;
                 state.nsysSession = nsysMode == NsysStartMode.SESSION ? nsysSession : "";
@@ -322,23 +519,31 @@ public final class DiagnoseOrchestrator {
             }
             copySparkOutputsIfAny(sparkDispatchTime, runDir, notes);
             sparkUrl = readSparkUrl(runDir);
-            log(latestLog, "Stopping PresentMon...");
-            presentMon.stop();
-            announceExportIfExists("PresentMon", presentCsv);
-            log(latestLog, "Stopping JFR and dumping recording...");
-            jfr.stopAndDump(recordingJfr);
-            announceExportIfExists("JFR", recordingJfr);
+            if (plan.presentMon && presentMon != null) {
+                log(latestLog, "Stopping PresentMon...");
+                presentMon.stop();
+                announceExportIfExists("PresentMon", presentCsv);
+            }
+            if (plan.jfr && jfr != null && recordingJfr != null) {
+                log(latestLog, "Stopping JFR and dumping recording...");
+                jfr.stopAndDump(recordingJfr);
+                announceExportIfExists("JFR", recordingJfr);
+            }
             log(latestLog, "Capture completed. Exporting.");
 
             ChatUi.info("Exporting profiler results...");
-            log(latestLog, "Running JFR parser against recording.jfr + presentmon.csv...");
-            new JfrParser().parse(recordingJfr, presentCsv, badFrames, jfr.startWall(), jfr.endWall());
-            announceExportIfExists("JFR bad frame analysis", badFrames);
-            log(latestLog, "Running ETL export pipeline...");
-            new EtlExportController(report, runDir, logsDir, notes).exportIfPossible();
-            announceExportIfExists("WPR trace", runDir.resolve("trace.etl"));
-            announceExportIfExists("WPA export", runDir.resolve("wpa_exports"));
-            announceExportIfExists("tracerpt export", runDir.resolve("trace_raw.csv"));
+            if (plan.jfr && plan.presentMon && recordingJfr != null && presentCsv != null && badFrames != null && jfr != null) {
+                log(latestLog, "Running JFR parser against recording.jfr + presentmon.csv...");
+                new JfrParser().parse(recordingJfr, presentCsv, badFrames, jfr.startWall(), jfr.endWall());
+                announceExportIfExists("JFR bad frame analysis", badFrames);
+            }
+            if (plan.wpr) {
+                log(latestLog, "Running ETL export pipeline...");
+                new EtlExportController(report, runDir, logsDir, notes).exportIfPossible();
+                announceExportIfExists("WPR trace", runDir.resolve("trace.etl"));
+                announceExportIfExists("WPA export", runDir.resolve("wpa_exports"));
+                announceExportIfExists("tracerpt export", runDir.resolve("trace_raw.csv"));
+            }
             if (nsysWasTimedProfile) {
                 Path nsysRep = runDir.resolve("nsys-report.nsys-rep");
                 long nsysWaitDeadline = nsysTimedDeadline + 5_000L; // 5s grace past expected finish
@@ -355,45 +560,53 @@ public final class DiagnoseOrchestrator {
                 }
             }
             log(latestLog, "Collecting external Nsight reports if present...");
-            NsysExternalCollector.collectPossibleReports(runDir, jfr.startWall(), notes);
-            announceExportIfExists("Nsight Systems", runDir.resolve("nsys-report.nsys-rep"));
-            announceExportIfExists("typeperf", hardwareCountersCsv);
-            announceExportIfExists("nvidia-smi", nvidiaSmiCsv);
-            announceExportIfExists("process contention", contentionCsv);
+            NsysExternalCollector.collectPossibleReports(runDir, jfr != null ? jfr.startWall() : Instant.now(), notes);
+            if (plan.nsys) {
+                announceExportIfExists("Nsight Systems", runDir.resolve("nsys-report.nsys-rep"));
+            }
+            if (plan.typeperf) {
+                announceExportIfExists("typeperf", hardwareCountersCsv);
+            }
+            if (plan.nvidiaSmi) {
+                announceExportIfExists("nvidia-smi", nvidiaSmiCsv);
+            }
+            if (plan.processContention) {
+                announceExportIfExists("process contention", contentionCsv);
+            }
 
             log(latestLog, "Writing system_info.json and README_ANALYZE.txt...");
-            BundleWriter.writeSystemInfo(systemInfo, mode, report, presentMon.targetPid(), jfr.startWall(), jfr.endWall());
-            if (mode == Mode.FULL) {
+            long targetPid = presentMon != null ? presentMon.targetPid() : ProcessHandle.current().pid();
+            Instant startWall = jfr != null ? jfr.startWall() : Instant.now();
+            Instant endWall = jfr != null ? jfr.endWall() : Instant.now();
+            BundleWriter.writeSystemInfo(systemInfo, mode, report, targetPid, startWall, endWall);
+            if (plan.nsys || plan.wpr) {
                 BundleWriter.includeFullModeFiles(runDir, notes);
             }
             BundleWriter.writeReadme(readme, mode, report.sparkPresent, notes);
 
-            List<Path> required = List.of(
-                presentCsv,
-                recordingJfr,
-                badFrames,
-                systemInfo,
-                readme,
-                presentStdout,
-                presentStderr,
-                jfrLog,
-                latestLog,
-                countersCsv,
-                hardwareCountersCsv
-            );
-            List<Path> optional = discoverOptionalFiles(runDir, required);
-            if (mode == Mode.PRIVACY) {
-                for (Path req : required) {
-                    if (Files.exists(req) && isTextFile(req)) {
-                        BundleWriter.redactTextFileInPlace(req, mode);
-                    }
-                }
-                for (Path opt : optional) {
-                    if (Files.exists(opt) && isTextFile(opt)) {
-                        BundleWriter.redactTextFileInPlace(opt, mode);
-                    }
-                }
+            List<Path> required = new ArrayList<>();
+            if (presentCsv != null) {
+                required.add(presentCsv);
+                required.add(presentStdout);
+                required.add(presentStderr);
             }
+            if (recordingJfr != null) {
+                required.add(recordingJfr);
+                required.add(jfrLog);
+            }
+            if (badFrames != null) {
+                required.add(badFrames);
+            }
+            required.add(systemInfo);
+            required.add(readme);
+            required.add(latestLog);
+            if (plan.perfCounters) {
+                required.add(countersCsv);
+            }
+            if (plan.typeperf) {
+                required.add(hardwareCountersCsv);
+            }
+            List<Path> optional = discoverOptionalFiles(runDir, required);
             for (Path req : required) {
                 if (!Files.exists(req)) {
                     throw new IllegalStateException("Required artifact missing before export: " + req.getFileName());
@@ -405,19 +618,30 @@ public final class DiagnoseOrchestrator {
             requiredWithManifest.add(manifest);
             log(latestLog, "Manifest written. requiredFiles=" + requiredWithManifest.size() + ", optionalCandidates=" + optional.size());
 
-            Path zip = runDir.resolveSibling("mc-diagnose-" + runDir.getFileName() + ".zip");
-            BundleWriter.zipResults(runDir, zip, requiredWithManifest, optional, notes);
-            log(latestLog, "Zip completed: " + zip);
+            String zipBaseName = "mc-diagnose-" + runRootDir.getFileName();
+            ChatUi.info("zipping, this might take a second");
+            List<Path> shareZips = BundleWriter.zipResultsPartitioned(
+                runRootDir,
+                zipBaseName,
+                requiredWithManifest,
+                optional,
+                notes,
+                SHARE_ZIP_MAX_BYTES,
+                SHARE_ZIP_MAX_PARTS
+            );
+            for (Path zip : shareZips) {
+                log(latestLog, "Share zip completed: " + zip);
+            }
 
-            collectProfilerStatus(runDir, report, working, failed);
-            sendFinalSummary(true, runDir, working, failed, sparkUrl);
+            collectProfilerStatus(runRootDir, runDir, report, plan, working, failed);
+            sendFinalSummary(true, runRootDir, working, failed, sparkUrl);
         } catch (Exception e) {
             TaggerMod.LOGGER.error("[Diagnose] Capture failed", e);
-            if (runDir != null) {
+            if (runRootDir != null && runDir != null) {
                 failed.add("diagnostics: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                collectProfilerStatus(runDir, report, working, failed);
+                collectProfilerStatus(runRootDir, runDir, report, plan, working, failed);
                 sparkUrl = readSparkUrl(runDir);
-                sendFinalSummary(false, runDir, working, failed, sparkUrl);
+                sendFinalSummary(false, runRootDir, working, failed, sparkUrl);
             } else {
                 ChatUi.error("Diagnostics failed before run directory creation: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             }
@@ -478,6 +702,9 @@ public final class DiagnoseOrchestrator {
             }
             active.set(false);
             activeRunDir = null;
+            sparkDispatchAt = null;
+            sparkUrlFromChat = null;
+            sparkUrlCapturedAt = null;
         }
     }
 
@@ -508,6 +735,20 @@ public final class DiagnoseOrchestrator {
                 baseArgs.get(5),
                 baseArgs.get(6)
             );
+            if (elevatedHelper != null && elevatedHelper.isReady()) {
+                ExportCommandResult elevated = runNsysElevated(report, runDir, baseArgs, replaceSuffix(logBaseFile, "-uac.stdout.log"), replaceSuffix(logBaseFile, "-uac.stderr.log"));
+                if (elevated.success()) {
+                    notes.add("nsys started via elevated helper.");
+                    announceStarted("Nsight Systems");
+                    return NsysStartMode.SESSION;
+                }
+                notes.add("nsys elevated helper start failed with exitCode=" + elevated.exitCode() + " timedOut=" + elevated.timedOut());
+                if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes, captureSeconds)) {
+                    announceStarted("Nsight Systems");
+                    return NsysStartMode.TIMED_PROFILE;
+                }
+                return NsysStartMode.NOT_STARTED;
+            }
             ProcessRunner.ProcessResult result = ProcessRunner.run(start, runDir, stdout, stderr, Duration.ofSeconds(10));
             if (result.timedOut() || result.exitCode() != 0) {
                 notes.add("nsys start failed with exitCode=" + result.exitCode() + " timedOut=" + result.timedOut());
@@ -594,7 +835,7 @@ public final class DiagnoseOrchestrator {
                 quickEditDisableScript() +
                 "$ErrorActionPreference='Stop'; " +
                 "$a=@('profile','--trace=none','--sample=none','--cpuctxsw=none','--duration','" + nsysDuration + "','--force-overwrite=true','-o','" + out + "','cmd','/c','timeout /t " + (nsysDuration + 1) + " >nul'); " +
-                "$p=Start-Process -FilePath '" + exe + "' -ArgumentList $a -WindowStyle Normal -PassThru; " +
+                "$p=Start-Process -FilePath '" + exe + "' -ArgumentList $a -WindowStyle Minimized -PassThru; " +
                 "if ($null -eq $p) { exit 1 }; exit 0";
             List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", script);
             ProcessRunner.ProcessResult result = ProcessRunner.run(cmd, runDir, stdout, stderr, Duration.ofSeconds(20), false);
@@ -611,6 +852,13 @@ public final class DiagnoseOrchestrator {
             return WprStartStatus.NOT_AVAILABLE;
         }
         try {
+            if (elevatedHelper != null && elevatedHelper.isReady()) {
+                if (startWprElevated(report, runDir, notes)) {
+                    notes.add("Started WPR via elevated helper.");
+                    announceStarted("WPR");
+                    return WprStartStatus.STARTED_ELEVATED;
+                }
+            }
             Path stdout = replaceSuffix(logBaseFile, ".stdout.log");
             Path stderr = replaceSuffix(logBaseFile, ".stderr.log");
             List<String> start = List.of(report.wpr.path.toString(), "-start", "generalprofile", "-filemode");
@@ -775,14 +1023,16 @@ public final class DiagnoseOrchestrator {
         }
         try {
             int timeout = Math.max(5, captureSeconds);
+            Instant dispatchAt = Instant.now();
+            this.sparkDispatchAt = dispatchAt;
             client.execute(() -> {
                 if (client.getNetworkHandler() != null) {
                     client.getNetworkHandler().sendChatCommand("sparkc profiler --timeout " + timeout + " --interval 1");
                 }
             });
             notes.add("Dispatched spark profiler command.");
-            Files.writeString(sparkLog, "spark command dispatched at " + Instant.now() + "\n");
-            return Instant.now();
+            Files.writeString(sparkLog, "spark command dispatched at " + dispatchAt + "\n");
+            return dispatchAt;
         } catch (Exception e) {
             notes.add("spark capture dispatch failed: " + e.getMessage());
             return null;
@@ -896,11 +1146,6 @@ public final class DiagnoseOrchestrator {
         }
     }
 
-    private boolean isTextFile(Path file) {
-        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
-        return name.endsWith(".txt") || name.endsWith(".json") || name.endsWith(".log") || name.endsWith(".csv");
-    }
-
     private Path replaceSuffix(Path base, String newSuffix) {
         String name = base.getFileName().toString();
         int dot = name.lastIndexOf('.');
@@ -968,24 +1213,41 @@ public final class DiagnoseOrchestrator {
         }
     }
 
-    private void collectProfilerStatus(Path runDir, ToolDetection.DetectionReport report, List<String> working, List<String> failed) {
-        addArtifactStatus("PresentMon", runDir.resolve("presentmon.csv"), working, failed);
-        addArtifactStatus("JFR", runDir.resolve("recording.jfr"), working, failed);
-        addArtifactStatus("typeperf", runDir.resolve("windows_hardware_counters.csv"), working, failed);
-        addArtifactStatus("process contention", runDir.resolve("process_contention.csv"), working, failed);
-        if (report.nvidiaSmi != null && report.nvidiaSmi.found) {
-            addArtifactStatus("nvidia-smi", runDir.resolve("nvidia_smi.csv"), working, failed);
+    private void collectProfilerStatus(Path runRootDir, Path resultsDir, ToolDetection.DetectionReport report, CapturePlan plan, List<String> working, List<String> failed) {
+        if (plan.presentMon) {
+            addArtifactStatus("PresentMon", resultsDir.resolve("presentmon.csv"), working, failed);
         }
-        if (report.nsys != null && report.nsys.found) {
-            addArtifactStatus("Nsight Systems export", runDir.resolve("nsys-report.nsys-rep"), working, failed);
+        if (plan.jfr) {
+            addArtifactStatus("JFR", resultsDir.resolve("recording.jfr"), working, failed);
         }
-        if (report.wpr != null && report.wpr.found) {
-            addArtifactStatus("WPR export", runDir.resolve("trace.etl"), working, failed);
+        if (plan.typeperf) {
+            addArtifactStatus("typeperf", resultsDir.resolve("windows_hardware_counters.csv"), working, failed);
         }
-        addArtifactStatus("manifest", runDir.resolve("index.json"), working, failed);
-        if (Files.exists(runDir.resolveSibling("mc-diagnose-" + runDir.getFileName() + ".zip"))) {
-            addUnique(working, "zip bundle");
-        } else {
+        if (plan.processContention) {
+            addArtifactStatus("process contention", resultsDir.resolve("process_contention.csv"), working, failed);
+        }
+        if (plan.nvidiaSmi && report.nvidiaSmi != null && report.nvidiaSmi.found) {
+            addArtifactStatus("nvidia-smi", resultsDir.resolve("nvidia_smi.csv"), working, failed);
+        }
+        if (plan.nsys && report.nsys != null && report.nsys.found) {
+            addArtifactStatus("Nsight Systems export", resultsDir.resolve("nsys-report.nsys-rep"), working, failed);
+        }
+        if (plan.wpr && report.wpr != null && report.wpr.found) {
+            addArtifactStatus("WPR export", resultsDir.resolve("trace.etl"), working, failed);
+        }
+        addArtifactStatus("manifest", resultsDir.resolve("index.json"), working, failed);
+        try (var stream = Files.list(runRootDir)) {
+            boolean anyZip = stream.anyMatch(path -> {
+                String n = path.getFileName().toString().toLowerCase(Locale.ROOT);
+                String base = "mc-diagnose-" + runRootDir.getFileName().toString().toLowerCase(Locale.ROOT);
+                return n.startsWith(base) && n.endsWith(".zip");
+            });
+            if (anyZip) {
+                addUnique(working, "zip bundle");
+            } else {
+                addUnique(failed, "zip bundle");
+            }
+        } catch (Exception e) {
             addUnique(failed, "zip bundle");
         }
     }
@@ -1048,9 +1310,39 @@ public final class DiagnoseOrchestrator {
         ChatUi.info("==================");
         ChatUi.info((success ? "Success: " : "Failed: ") + joinOrNone(working));
         ChatUi.info("failed: " + joinOrNone(failed));
-        ChatUi.info("spark data: " + (sparkUrl == null || sparkUrl.isBlank() ? "not available" : sparkUrl));
-        ChatUi.clickableOpenFolderLabel("**OPEN RESULTS FOLDER**", runDir);
+        if (sparkUrl == null || sparkUrl.isBlank() || "not available".equalsIgnoreCase(sparkUrl)) {
+            ChatUi.info("spark data: not available");
+        } else {
+            ChatUi.clickableUrl("spark data: " + sparkUrl, sparkUrl);
+        }
+        Path resultsFolder = runDir;
+        ChatUi.clickableOpenFolderLabel("**OPEN RESULTS FOLDER**", resultsFolder);
         ChatUi.info("==================");
+    }
+
+    public synchronized boolean startPresentMonWithHelper(Path exe, List<String> args, Path workDir, Path stdout, Path stderr) {
+        try {
+            List<String> helperNotes = new ArrayList<>();
+            ElevatedHelper helper = ensureElevatedHelper(workDir, helperNotes);
+            if (helper == null || !helper.isReady()) {
+                return false;
+            }
+            ElevatedHelper.CommandResult result = helper.runCommand(
+                exe.toAbsolutePath().toString(),
+                args,
+                workDir.toAbsolutePath().toString(),
+                stdout.toAbsolutePath().toString(),
+                stderr.toAbsolutePath().toString(),
+                30_000L,
+                false
+            );
+            TaggerMod.LOGGER.info("[Diagnose][PresentMon] helper detached launch exitCode={} timedOut={} error={}",
+                result.exitCode(), result.timedOut(), result.error());
+            return !result.timedOut() && result.exitCode() == 0;
+        } catch (Exception e) {
+            TaggerMod.LOGGER.warn("[Diagnose][PresentMon] helper launch failed", e);
+            return false;
+        }
     }
 
     private String joinOrNone(List<String> items) {
@@ -1152,7 +1444,7 @@ public final class DiagnoseOrchestrator {
         String script =
             quickEditDisableScript() +
             "$ErrorActionPreference='Stop'; " +
-            "$p=Start-Process -FilePath '" + exe + "' -ArgumentList @('-start','generalprofile','-filemode') -Verb RunAs -PassThru; " +
+            "$p=Start-Process -FilePath '" + exe + "' -ArgumentList @('-start','generalprofile','-filemode') -Verb RunAs -WindowStyle Minimized -PassThru; " +
             "if ($null -eq $p) { exit 1 }; " +
             "$p.WaitForExit(); exit $p.ExitCode";
         List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", script);
@@ -1178,7 +1470,7 @@ public final class DiagnoseOrchestrator {
             String script =
                 quickEditDisableScript() +
                 "$ErrorActionPreference='Stop'; " +
-                "$p=Start-Process -FilePath '" + exe + "' -ArgumentList @('-stop','" + etl + "') -Verb RunAs -PassThru; " +
+                "$p=Start-Process -FilePath '" + exe + "' -ArgumentList @('-stop','" + etl + "') -Verb RunAs -WindowStyle Minimized -PassThru; " +
                 "if ($null -eq $p) { exit 1 }; " +
                 "$p.WaitForExit(); exit $p.ExitCode";
             List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", script);
@@ -1212,7 +1504,7 @@ public final class DiagnoseOrchestrator {
                 scriptBuilder.append("$a.Add('").append(arg.replace("'", "''")).append("'); ");
             }
             scriptBuilder.append("$p=Start-Process -FilePath '").append(exe)
-                .append("' -ArgumentList $a -Verb RunAs -PassThru; ");
+                .append("' -ArgumentList $a -Verb RunAs -WindowStyle Minimized -PassThru; ");
             scriptBuilder.append("if ($null -eq $p) { exit 1 }; ");
             scriptBuilder.append("$p.WaitForExit(); exit $p.ExitCode");
             String script = scriptBuilder.toString();
@@ -1274,40 +1566,85 @@ public final class DiagnoseOrchestrator {
 
     private int fetchSparkFromUrl(Instant dispatchTime, Path runDir, List<String> notes) {
         try {
+            String found = sparkUrlFromChat;
+            if (found == null || found.isBlank()) {
+                // Give chat-capture a short chance to arrive before falling back to log scraping.
+                long waitUntil = System.currentTimeMillis() + 8_000L;
+                while (System.currentTimeMillis() < waitUntil) {
+                    found = sparkUrlFromChat;
+                    if (found != null && !found.isBlank()) {
+                        break;
+                    }
+                    try {
+                        Thread.sleep(200L);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+            if (found != null && !found.isBlank()) {
+                notes.add("spark URL captured from chat" + (sparkUrlCapturedAt != null ? " at " + sparkUrlCapturedAt : "") + ".");
+            }
+
             Path gameLatestLog = FabricLoader.getInstance().getGameDir().resolve("logs").resolve("latest.log");
-            if (!Files.exists(gameLatestLog)) {
+            if ((found == null || found.isBlank()) && !Files.exists(gameLatestLog)) {
                 notes.add("spark URL fetch skipped: latest.log not found.");
                 return 0;
             }
-            String logText = readTail(gameLatestLog, 512 * 1024);
-            Matcher matcher = SPARK_URL_PATTERN.matcher(logText);
-            String found = null;
-            while (matcher.find()) {
-                found = matcher.group(1);
+            if (found == null || found.isBlank()) {
+                String logText = readTail(gameLatestLog, 512 * 1024);
+                Matcher matcher = SPARK_URL_PATTERN.matcher(logText);
+                while (matcher.find()) {
+                    found = matcher.group(1);
+                }
             }
             if (found == null || found.isBlank()) {
                 notes.add("spark URL not found in latest.log.");
                 return 0;
             }
+            Files.writeString(runDir.resolve("spark-profile-url.txt"), found + System.lineSeparator(), StandardCharsets.UTF_8);
             String rawUrl = found.contains("?") ? found + "&raw=1&full=true" : found + "?raw=1&full=true";
             HttpClient client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
-            HttpRequest request = HttpRequest.newBuilder(URI.create(rawUrl))
-                .timeout(Duration.ofSeconds(20))
-                .GET()
-                .build();
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            if (response.statusCode() < 200 || response.statusCode() >= 300 || response.body() == null || response.body().isBlank()) {
-                notes.add("spark URL fetch failed: status=" + response.statusCode());
-                return 0;
+            Exception lastException = null;
+            int lastStatus = -1;
+            for (int attempt = 1; attempt <= SPARK_FETCH_RETRIES; attempt++) {
+                try {
+                    HttpRequest request = HttpRequest.newBuilder(URI.create(rawUrl))
+                        .timeout(Duration.ofSeconds(20))
+                        .GET()
+                        .build();
+                    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                    lastStatus = response.statusCode();
+                    if (response.statusCode() >= 200 && response.statusCode() < 300 && response.body() != null && !response.body().isBlank()) {
+                        Path out = runDir.resolve("spark-profiler-full.json");
+                        Files.writeString(out, response.body(), StandardCharsets.UTF_8);
+                        notes.add("Fetched spark profile from URL on attempt " + attempt + ".");
+                        return 1;
+                    }
+                    notes.add("spark URL fetch attempt " + attempt + " failed: status=" + response.statusCode());
+                } catch (Exception e) {
+                    lastException = e;
+                    notes.add("spark URL fetch attempt " + attempt + " failed: " + e.getMessage());
+                }
+                if (attempt < SPARK_FETCH_RETRIES) {
+                    try {
+                        Thread.sleep(SPARK_FETCH_RETRY_BACKOFF_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             }
-            Path out = runDir.resolve("spark-profiler-full.json");
-            Files.writeString(out, response.body(), StandardCharsets.UTF_8);
-            Files.writeString(runDir.resolve("spark-profile-url.txt"), found + System.lineSeparator(), StandardCharsets.UTF_8);
-            notes.add("Fetched spark profile from URL.");
-            return 1;
+            if (lastException != null) {
+                notes.add("spark URL fetch failed after retries: " + lastException.getMessage());
+            } else {
+                notes.add("spark URL fetch failed after retries: status=" + lastStatus);
+            }
+            return 0;
         } catch (Exception e) {
             notes.add("spark URL fetch failed: " + e.getMessage());
             return 0;
@@ -1424,7 +1761,7 @@ public final class DiagnoseOrchestrator {
 
             String launcherScript =
                 "$ErrorActionPreference='Stop'; " +
-                "$p=Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','" + psEscape(helperScript.toAbsolutePath().toString()) + "') -Verb RunAs -PassThru; " +
+                "$p=Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','" + psEscape(helperScript.toAbsolutePath().toString()) + "') -Verb RunAs -WindowStyle Hidden -PassThru; " +
                 "if ($null -eq $p) { exit 1 }; exit 0";
             List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", launcherScript);
             ProcessRunner.ProcessResult launch = ProcessRunner.run(cmd, helper.rootDir, launchStdout, launchStderr, Duration.ofSeconds(20), false);
@@ -1448,6 +1785,10 @@ public final class DiagnoseOrchestrator {
         }
 
         CommandResult runCommand(String exe, List<String> args, String workDir, String stdout, String stderr, long timeoutMs) {
+            return runCommand(exe, args, workDir, stdout, stderr, timeoutMs, true);
+        }
+
+        CommandResult runCommand(String exe, List<String> args, String workDir, String stdout, String stderr, long timeoutMs, boolean waitForExit) {
             long start = System.currentTimeMillis();
             if (!ready) {
                 return new CommandResult(-1, false, 0L, "helper_not_ready");
@@ -1457,7 +1798,7 @@ public final class DiagnoseOrchestrator {
             Path resultFile = resultsDir.resolve(String.format("%06d.json", id));
             try {
                 Files.deleteIfExists(resultFile);
-                String payload = commandJson(exe, args, workDir, stdout, stderr, timeoutMs);
+                String payload = commandJson(exe, args, workDir, stdout, stderr, timeoutMs, waitForExit);
                 Files.writeString(commandFile, payload, StandardCharsets.UTF_8);
 
                 long deadline = System.currentTimeMillis() + timeoutMs + 10_000L;
@@ -1490,7 +1831,7 @@ public final class DiagnoseOrchestrator {
             ready = false;
         }
 
-        private static String commandJson(String exe, List<String> args, String workDir, String stdout, String stderr, long timeoutMs) {
+        private static String commandJson(String exe, List<String> args, String workDir, String stdout, String stderr, long timeoutMs, boolean waitForExit) {
             StringBuilder sb = new StringBuilder();
             sb.append("{");
             sb.append("\"exe\":\"").append(jsonEscape(exe)).append("\",");
@@ -1505,7 +1846,8 @@ public final class DiagnoseOrchestrator {
             sb.append("\"workDir\":\"").append(jsonEscape(workDir)).append("\",");
             sb.append("\"stdout\":\"").append(jsonEscape(stdout)).append("\",");
             sb.append("\"stderr\":\"").append(jsonEscape(stderr)).append("\",");
-            sb.append("\"timeoutMs\":").append(timeoutMs);
+            sb.append("\"timeoutMs\":").append(timeoutMs).append(",");
+            sb.append("\"waitForExit\":").append(waitForExit);
             sb.append("}");
             return sb.toString();
         }
@@ -1544,7 +1886,8 @@ public final class DiagnoseOrchestrator {
                 "      $cmd = Get-Content -Raw -Path $f.FullName | ConvertFrom-Json\n" +
                 "      $argList = @(); foreach ($a in $cmd.args) { $argList += [string]$a }\n" +
                 "      Add-Content -Path $log -Value (\"[{0}] run {1} {2}\" -f (Get-Date).ToString('o'), [string]$cmd.exe, ($argList -join ' '))\n" +
-                "      $p = Start-Process -FilePath ([string]$cmd.exe) -ArgumentList $argList -WorkingDirectory ([string]$cmd.workDir) -RedirectStandardOutput ([string]$cmd.stdout) -RedirectStandardError ([string]$cmd.stderr) -PassThru\n" +
+                "      $p = Start-Process -FilePath ([string]$cmd.exe) -ArgumentList $argList -WorkingDirectory ([string]$cmd.workDir) -WindowStyle Minimized -RedirectStandardOutput ([string]$cmd.stdout) -RedirectStandardError ([string]$cmd.stderr) -PassThru\n" +
+                "      if ($cmd.waitForExit -eq $false) { $exitCode = 0 } else { " +
                 "      $ok = $p.WaitForExit([int]$cmd.timeoutMs)\n" +
                 "      if (-not $ok) { try { $p.Kill() } catch {}; $timedOut = $true; $exitCode = -1 } else { " +
                 "        $p.WaitForExit(); " +
@@ -1564,6 +1907,7 @@ public final class DiagnoseOrchestrator {
                 "            $exitCode = 1; " +
                 "          } " +
                 "        } " +
+                "      }\n" +
                 "      }\n" +
                 "    } catch { $err = $_.ToString() }\n" +
                 "    Add-Content -Path $log -Value (\"[{0}] done {1} exit={2} timedOut={3} err={4}\" -f (Get-Date).ToString('o'), $f.BaseName, $exitCode, $timedOut, $err)\n" +

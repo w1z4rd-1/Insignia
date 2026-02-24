@@ -77,6 +77,63 @@ public class InsigniaConfigScreen {
             .setTooltip(Text.literal("Color of the totem warning overlay"))
             .setSaveConsumer(newValue -> config.totemWarningColor = newValue)
             .build());
+
+        // Profiler Category
+        ConfigCategory profiler = builder.getOrCreateCategory(Text.literal("Profiler"));
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: PresentMon"), config.diagnoseCustomPresentMon)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable PresentMon capture for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomPresentMon = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: JFR"), config.diagnoseCustomJfr)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable Java Flight Recorder for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomJfr = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: Perf Counters"), config.diagnoseCustomPerfCounters)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable internal JVM/OS counters sampler for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomPerfCounters = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: typeperf"), config.diagnoseCustomTypeperf)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable Windows hardware counters (typeperf) for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomTypeperf = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: Process Contention"), config.diagnoseCustomProcessContention)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable process contention sampler for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomProcessContention = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: nvidia-smi"), config.diagnoseCustomNvidiaSmi)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable NVIDIA telemetry for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomNvidiaSmi = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: spark"), config.diagnoseCustomSpark)
+            .setDefaultValue(true)
+            .setTooltip(Text.literal("Enable spark profiler dispatch for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomSpark = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: Nsight Systems"), config.diagnoseCustomNsight)
+            .setDefaultValue(false)
+            .setTooltip(Text.literal("Enable Nsight capture for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomNsight = newValue)
+            .build());
+
+        profiler.addEntry(entryBuilder.startBooleanToggle(Text.literal("Custom: WPR"), config.diagnoseCustomWpr)
+            .setDefaultValue(false)
+            .setTooltip(Text.literal("Enable WPR trace capture for /diagnose custom"))
+            .setSaveConsumer(newValue -> config.diagnoseCustomWpr = newValue)
+            .build());
         
         return builder.build();
     }

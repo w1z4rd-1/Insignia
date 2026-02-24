@@ -30,6 +30,17 @@ public class InsigniaConfig {
     // Totem Warning Overlay Settings
     public boolean totemWarningEnabled = true;
     public int totemWarningColor = 0x40FF0000; // Semi-transparent red
+
+    // Diagnose Custom Mode Profiler Toggles
+    public boolean diagnoseCustomPresentMon = true;
+    public boolean diagnoseCustomJfr = true;
+    public boolean diagnoseCustomPerfCounters = true;
+    public boolean diagnoseCustomTypeperf = true;
+    public boolean diagnoseCustomProcessContention = true;
+    public boolean diagnoseCustomNvidiaSmi = true;
+    public boolean diagnoseCustomSpark = true;
+    public boolean diagnoseCustomNsight = false;
+    public boolean diagnoseCustomWpr = false;
     
     public static InsigniaConfig getInstance() {
         return INSTANCE;

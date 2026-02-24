@@ -16,15 +16,15 @@ public final class DiagnoseCommand {
                 DiagnoseOrchestrator.getInstance().showSetupHelp(context.getSource());
                 return 1;
             })
-            .then(ClientCommandManager.literal("privacy")
+            .then(ClientCommandManager.literal("normal")
                 .executes(context -> {
-                    DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.PRIVACY, context.getSource());
+                    DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.NORMAL, context.getSource());
                     return 1;
                 })
                 .then(ClientCommandManager.argument("time", IntegerArgumentType.integer(5, 3600))
                     .executes(context -> {
                         int seconds = IntegerArgumentType.getInteger(context, "time");
-                        DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.PRIVACY, seconds, context.getSource());
+                        DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.NORMAL, seconds, context.getSource());
                         return 1;
                     }))
             )
@@ -37,6 +37,18 @@ public final class DiagnoseCommand {
                     .executes(context -> {
                         int seconds = IntegerArgumentType.getInteger(context, "time");
                         DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.FULL, seconds, context.getSource());
+                        return 1;
+                    }))
+            )
+            .then(ClientCommandManager.literal("custom")
+                .executes(context -> {
+                    DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.CUSTOM, context.getSource());
+                    return 1;
+                })
+                .then(ClientCommandManager.argument("time", IntegerArgumentType.integer(5, 3600))
+                    .executes(context -> {
+                        int seconds = IntegerArgumentType.getInteger(context, "time");
+                        DiagnoseOrchestrator.getInstance().start(DiagnoseOrchestrator.Mode.CUSTOM, seconds, context.getSource());
                         return 1;
                     }))
             )

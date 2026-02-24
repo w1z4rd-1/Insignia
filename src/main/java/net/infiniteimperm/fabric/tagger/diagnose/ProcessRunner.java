@@ -22,7 +22,6 @@ public final class ProcessRunner {
     public static ProcessResult run(List<String> command, Path workDir, Path stdoutLog, Path stderrLog, Duration timeout, boolean warnOnTimeout) throws IOException, InterruptedException {
         validateLogTargets(stdoutLog, stderrLog);
         TaggerMod.LOGGER.info("[Diagnose][Process] Running command: {}", command);
-        TaggerMod.LOGGER.info("[Diagnose][Process] WorkDir: {}", workDir);
         Files.createDirectories(stdoutLog.getParent());
         Files.createDirectories(stderrLog.getParent());
 
@@ -57,7 +56,6 @@ public final class ProcessRunner {
     public static Process start(List<String> command, Path workDir, Path stdoutLog, Path stderrLog) throws IOException {
         validateLogTargets(stdoutLog, stderrLog);
         TaggerMod.LOGGER.info("[Diagnose][Process] Starting process: {}", command);
-        TaggerMod.LOGGER.info("[Diagnose][Process] WorkDir: {}", workDir);
         Files.createDirectories(stdoutLog.getParent());
         Files.createDirectories(stderrLog.getParent());
 

@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -18,6 +19,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 public final class BundleWriter {
+    private static final long TRACE_ETL_SHARE_MAX_BYTES = 3_435_973_836L; // 3.2 GiB
     public static Path writeSystemInfo(
         Path outFile,
         DiagnoseOrchestrator.Mode mode,
@@ -114,29 +116,43 @@ public final class BundleWriter {
         sb.append("- process_contention.csv\n");
         sb.append("- system_info.json\n");
         sb.append("- logs/*.log\n\n");
-        sb.append("How to inspect recording.jfr:\n");
-        sb.append("- Open with JDK Mission Control (JMC), then inspect Method Profiling / Memory / Lock Instances.\n\n");
-        sb.append("Nsight Systems docs:\n");
-        sb.append("- https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html\n\n");
-        sb.append("Frame boundary notes:\n");
-        sb.append("- HUD render callback frame boundaries were recorded as a stable frame proxy.\n\n");
-        sb.append("CapFrameX note:\n");
-        sb.append("- CapFrameX is a popular PresentMon analysis tool: https://github.com/CXWorld/CapFrameX\n");
-        sb.append("- Analysts/AI may use CapFrameX-style interpretation and Python to analyze this bundle.\n\n");
-        sb.append("Optimized ChatGPT Analysis Prompt:\n");
-        sb.append("- Analyze this diagnostics bundle for Minecraft stutter root causes. Use presentmon.csv for frame-time outliers,\n");
-        sb.append("  recording.jfr for CPU/allocation/lock/GC correlation, and optional ETL/nsys outputs for system behavior.\n");
-        sb.append("  Produce: (1) top likely root causes, (2) confidence-ranked evidence with timestamps, (3) specific mod/config/runtime fixes,\n");
-        sb.append("  (4) prioritized next measurements to disambiguate uncertainty. If internet access is available, search for current mods or\n");
-        sb.append("  settings known to mitigate the identified issue patterns and cite them.\n\n");
+        sb.append("Custom JFR events emitted by this mod (category: Insignia):\n");
+        sb.append("- insignia.HudFrameStart(frameId, nanoTime, wallMillis)\n");
+        sb.append("- insignia.HudFrameEnd(frameId, nanoTime, wallMillis, frameDurationNs)\n");
+        sb.append("- insignia.FramePhase(frameId, phase, durationNs, nanoTime, wallMillis)\n");
+        sb.append("  phase enum: 1=WORLD, 2=ENTITIES, 3=BLOCK_ENTITIES, 4=PARTICLES, 5=GUI, 6=POST, 7=UPLOADS\n");
+        sb.append("- insignia.FrameSummary(frameId, totalFrameDurationNs + aggregated per-frame counters)\n");
+        sb.append("- insignia.FrameBoundary(phase, frameIndex, nanoTime, wallMillis) [legacy HUD boundary marker]\n");
+        sb.append("- insignia.WorldTransition(transitionType, durationNs, nanoTime, wallMillis)\n");
+        sb.append("  transitionType enum: 1=JOIN, 2=LEAVE, 3=DIM_CHANGE\n");
+        sb.append("- insignia.UserStutterMark(frameId, label, nanoTime, wallMillis)\n");
+        sb.append("- insignia.ResourceReload(phase, durationNs, nanoTime, wallMillis)\n");
+        sb.append("  phase enum: 1=START, 2=END\n");
+        sb.append("- insignia.ChunkBuildBatch(frameId, chunkCount, buildDurationNs, uploadDurationNs)\n");
+        sb.append("- insignia.BufferUploadBatch(frameId, uploadCount, bytes, durationNs)\n");
+        sb.append("- insignia.TextureUploadBatch(frameId, uploadCount, bytes, durationNs)\n");
+        sb.append("- insignia.ShaderCompileBatch(frameId, compileCount, durationNs)\n");
+        sb.append("Note: some batch events may be sparsely populated depending on active renderer hooks.\n\n");
+        sb.append("Reference parsing behavior:\n");
+        sb.append("- PresentMon interpretation should follow CapFrameX-style frame-time analysis patterns.\n");
+        sb.append("- Reference implementation: https://github.com/CXWorld/CapFrameX\n");
+        sb.append("- Nsight export/reference docs: https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html\n\n");
+        sb.append("Optimized AI analysis prompt:\n");
+        sb.append("- Analyze this diagnostics bundle for Minecraft stutter root causes.\n");
+        sb.append("- Use presentmon.csv for frame-time spikes and pacing anomalies.\n");
+        sb.append("- Use recording.jfr + insignia.FrameBoundary events to correlate bad frames with CPU samples, allocations, locks, parks, and GC pauses.\n");
+        sb.append("- Use ETL/nsys outputs when present to validate GPU/driver/scheduler hypotheses.\n");
+        sb.append("- Provide:\n");
+        sb.append("  1) Top likely root causes ranked by confidence.\n");
+        sb.append("  2) Timestamped evidence for each cause.\n");
+        sb.append("  3) Concrete fixes the user can apply now (mods/settings/JVM/driver/runtime), with rationale.\n");
+        sb.append("  4) External research on relevant mod implementations and source code (especially GitHub) that addresses similar symptoms, and whether that approach matches this capture.\n\n");
         if (!notes.isEmpty()) {
             sb.append("Notes:\n");
             for (String note : notes) {
                 sb.append("- ").append(note).append("\n");
             }
         }
-        sb.append("\nPrivacy reminder:\n");
-        sb.append("- Before sharing, review files for anything sensitive.\n");
         Files.writeString(outFile, sb.toString(), StandardCharsets.UTF_8);
         return outFile;
     }
@@ -199,21 +215,107 @@ public final class BundleWriter {
         return zipPath;
     }
 
-    public static void redactTextFileInPlace(Path file, DiagnoseOrchestrator.Mode mode) throws IOException {
-        if (mode != DiagnoseOrchestrator.Mode.PRIVACY || !Files.exists(file) || !Files.isRegularFile(file)) {
-            return;
+    public static List<Path> zipResultsPartitioned(
+        Path runDir,
+        String zipBaseName,
+        List<Path> required,
+        List<Path> optional,
+        List<String> notes,
+        long maxZipBytes,
+        int maxParts) throws IOException {
+        Set<Path> selectedSet = new LinkedHashSet<>();
+        for (Path req : required) {
+            if (!Files.exists(req)) {
+                throw new IOException("Missing required artifact: " + req.toAbsolutePath());
+            }
+            selectedSet.add(req);
         }
-        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
-        if (name.equals("system_info.json")) {
-            return;
+        for (Path opt : optional) {
+            if (!Files.exists(opt)) {
+                continue;
+            }
+            Path rel = runDir.relativize(opt);
+            String relText = rel.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+            boolean isTraceEtl = relText.equals("results/trace.etl") || relText.equals("trace.etl");
+            if (isTraceEtl && safeSize(opt) > TRACE_ETL_SHARE_MAX_BYTES) {
+                continue;
+            }
+            // Skip huge symbol extraction folders in share zips; full folder still contains everything.
+            if (relText.startsWith("results/trace.etl.ngenpdb/")
+                || relText.startsWith("results/trace.etl.embeddedpdbs/")) {
+                continue;
+            }
+            selectedSet.add(opt);
         }
-        String content = Files.readString(file, StandardCharsets.UTF_8);
-        if (name.equals("options.txt") || name.contains("sodium") || name.contains("lithium")) {
-            content = RedactionUtil.sanitizeKnownConfigContent(content);
+
+        List<Path> files = new ArrayList<>(selectedSet);
+        files.sort(Comparator.comparingLong(BundleWriter::safeSize).reversed());
+
+        List<List<Path>> bins = new ArrayList<>();
+        List<Long> binSizes = new ArrayList<>();
+        List<Path> skipped = new ArrayList<>();
+        for (Path file : files) {
+            long size = safeSize(file);
+            String relText = runDir.relativize(file).toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+            boolean isTraceEtl = relText.equals("results/trace.etl") || relText.equals("trace.etl");
+            if (size > maxZipBytes && !isTraceEtl) {
+                skipped.add(file);
+                continue;
+            }
+            boolean placed = false;
+            for (int i = 0; i < bins.size(); i++) {
+                if (binSizes.get(i) + size <= maxZipBytes) {
+                    bins.get(i).add(file);
+                    binSizes.set(i, binSizes.get(i) + size);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                if (bins.size() < maxParts) {
+                    List<Path> newBin = new ArrayList<>();
+                    newBin.add(file);
+                    bins.add(newBin);
+                    binSizes.add(size);
+                } else {
+                    skipped.add(file);
+                }
+            }
         }
-        // Redact Windows user paths (e.g. C:\Users\<name>\...) present in all text artifacts.
-        content = RedactionUtil.redactUserPathOnly(content);
-        Files.writeString(file, content, StandardCharsets.UTF_8);
+
+        List<Path> out = new ArrayList<>();
+        for (int i = 0; i < bins.size(); i++) {
+            String name = bins.size() == 1
+                ? zipBaseName + ".zip"
+                : zipBaseName + "-part" + (i + 1) + ".zip";
+            Path zipPath = runDir.resolve(name);
+            try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zipPath))) {
+                for (Path file : bins.get(i)) {
+                    if (!Files.exists(file)) {
+                        continue;
+                    }
+                    Path relative = runDir.relativize(file);
+                    zos.putNextEntry(new ZipEntry(relative.toString().replace('\\', '/')));
+                    Files.copy(file, zos);
+                    zos.closeEntry();
+                }
+            }
+            out.add(zipPath);
+            notes.add("Created share zip: " + zipPath.getFileName());
+        }
+
+        if (!skipped.isEmpty()) {
+            notes.add("Skipped " + skipped.size() + " file(s) from share zips due size cap/part limit.");
+        }
+        return out;
+    }
+
+    private static long safeSize(Path path) {
+        try {
+            return Files.size(path);
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 
     private static String escape(String input) {

@@ -3,8 +3,10 @@ package net.infiniteimperm.fabric.tagger.diagnose;
 import net.infiniteimperm.fabric.tagger.TaggerMod;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -98,10 +100,12 @@ public final class PresentMonController {
         if (elevatedTimedMode) {
             waitForCsvReady(Duration.ofSeconds(20));
             ensureCsvFromFallback();
+            waitForCsvReadable(Duration.ofSeconds(15));
             return;
         }
         ProcessRunner.stop(process, Duration.ofSeconds(3));
         ensureCsvFromFallback();
+        waitForCsvReadable(Duration.ofSeconds(15));
     }
 
     public Path csvPath() {
@@ -132,6 +136,18 @@ public final class PresentMonController {
         pmArgs.add("131072");
         pmArgs.add("--no_console_stats");
 
+        boolean helperStarted = DiagnoseOrchestrator.getInstance().startPresentMonWithHelper(
+            tool.path,
+            pmArgs,
+            workDir,
+            stdoutLog,
+            stderrLog
+        );
+        if (helperStarted) {
+            TaggerMod.LOGGER.info("[Diagnose][PresentMon] Started via elevated helper.");
+            return;
+        }
+
         StringBuilder argList = new StringBuilder();
         for (String arg : pmArgs) {
             if (argList.length() > 0) {
@@ -142,7 +158,7 @@ public final class PresentMonController {
 
         String script = "$pm='" + psEscape(tool.path.toString()) + "'; "
             + "$a=@(" + argList + "); "
-            + "Start-Process -FilePath $pm -ArgumentList $a -Verb RunAs";
+            + "Start-Process -FilePath $pm -ArgumentList $a -Verb RunAs -WindowStyle Minimized";
 
         List<String> command = List.of(
             "powershell.exe",
@@ -177,6 +193,27 @@ public final class PresentMonController {
             }
             Thread.sleep(250L);
         }
+    }
+
+    private void waitForCsvReadable(Duration timeout) throws Exception {
+        long end = System.currentTimeMillis() + timeout.toMillis();
+        Exception last = null;
+        while (System.currentTimeMillis() < end) {
+            try {
+                if (Files.exists(csvPath) && Files.size(csvPath) > 0) {
+                    try (FileChannel ignored = FileChannel.open(csvPath, StandardOpenOption.READ)) {
+                        return;
+                    }
+                }
+            } catch (Exception e) {
+                last = e;
+            }
+            Thread.sleep(200L);
+        }
+        if (last != null) {
+            throw new IllegalStateException("presentmon.csv remained locked after capture stop.", last);
+        }
+        throw new IllegalStateException("presentmon.csv not readable after capture stop.");
     }
 
     private void ensureCsvFromFallback() throws Exception {
