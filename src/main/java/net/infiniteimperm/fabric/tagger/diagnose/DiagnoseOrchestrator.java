@@ -58,7 +58,7 @@ public final class DiagnoseOrchestrator {
     private static final long EXPORT_WAIT_NOTICE_MS = 30_000L;
     private static final long EXPORT_TIMEOUT_MS = 60_000L;
     private static final String ACTIVE_STATE_FILE = "active-session.properties";
-    private static final long SHARE_ZIP_MAX_BYTES = 500L * 1024L * 1024L;
+    private static final long SHARE_ZIP_MAX_BYTES = 512L * 1024L * 1024L;
     private static final int SHARE_ZIP_MAX_PARTS = 3;
     private static final Pattern SPARK_URL_PATTERN = Pattern.compile("(https://spark\\.lucko\\.me/[A-Za-z0-9]+)");
     private static final int SPARK_FETCH_RETRIES = 3;
@@ -1325,6 +1325,7 @@ public final class DiagnoseOrchestrator {
             List<String> helperNotes = new ArrayList<>();
             ElevatedHelper helper = ensureElevatedHelper(workDir, helperNotes);
             if (helper == null || !helper.isReady()) {
+                ChatUi.warn("Elevated helper unavailable for PresentMon. Falling back to direct UAC launch.");
                 return false;
             }
             ElevatedHelper.CommandResult result = helper.runCommand(
@@ -1338,9 +1339,14 @@ public final class DiagnoseOrchestrator {
             );
             TaggerMod.LOGGER.info("[Diagnose][PresentMon] helper detached launch exitCode={} timedOut={} error={}",
                 result.exitCode(), result.timedOut(), result.error());
-            return !result.timedOut() && result.exitCode() == 0;
+            boolean ok = !result.timedOut() && result.exitCode() == 0;
+            if (!ok) {
+                ChatUi.warn("Elevated helper failed to launch PresentMon (exit=" + result.exitCode() + "). Falling back to direct UAC launch.");
+            }
+            return ok;
         } catch (Exception e) {
             TaggerMod.LOGGER.warn("[Diagnose][PresentMon] helper launch failed", e);
+            ChatUi.warn("Elevated helper launch failed for PresentMon. Falling back to direct UAC launch.");
             return false;
         }
     }

@@ -10,10 +10,13 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Mixin(MinecraftClient.class)
 public abstract class MinecraftClientReloadMixin {
+    @Unique
+    private static final AtomicInteger INSIGNIA_RELOAD_DEPTH = new AtomicInteger(0);
     @Unique
     private static final AtomicLong INSIGNIA_RELOAD_START_NS = new AtomicLong(0L);
 
@@ -39,31 +42,38 @@ public abstract class MinecraftClientReloadMixin {
 
     @Unique
     private void insignia$markReloadStart() {
-        long now = System.nanoTime();
-        INSIGNIA_RELOAD_START_NS.set(now);
-        DiagnoseOrchestrator.onResourceReloadStart();
-        TaggerMod.LOGGER.info("[Diagnose][JFR] Resource reload START");
+        if (INSIGNIA_RELOAD_DEPTH.getAndIncrement() == 0) {
+            long now = System.nanoTime();
+            INSIGNIA_RELOAD_START_NS.set(now);
+            DiagnoseOrchestrator.onResourceReloadStart();
+            TaggerMod.LOGGER.info("[Diagnose][JFR] Resource reload START");
+        }
     }
 
     @Unique
     private void insignia$attachReloadEnd(CallbackInfoReturnable<CompletableFuture<Void>> cir) {
         CompletableFuture<Void> future = cir.getReturnValue();
         if (future == null) {
-            long start = INSIGNIA_RELOAD_START_NS.getAndSet(0L);
-            long durationNs = start > 0L ? Math.max(0L, System.nanoTime() - start) : 0L;
-            DiagnoseOrchestrator.onResourceReloadEnd(durationNs);
-            TaggerMod.LOGGER.info("[Diagnose][JFR] Resource reload END durationNs={}", durationNs);
+            insignia$completeReloadInvocation(null);
             return;
         }
-        future.whenComplete((ignored, throwable) -> {
-            long start = INSIGNIA_RELOAD_START_NS.getAndSet(0L);
-            long durationNs = start > 0L ? Math.max(0L, System.nanoTime() - start) : 0L;
-            DiagnoseOrchestrator.onResourceReloadEnd(durationNs);
-            if (throwable == null) {
-                TaggerMod.LOGGER.info("[Diagnose][JFR] Resource reload END durationNs={}", durationNs);
-            } else {
-                TaggerMod.LOGGER.warn("[Diagnose][JFR] Resource reload END with error durationNs={}", durationNs, throwable);
-            }
-        });
+        future.whenComplete((ignored, throwable) -> insignia$completeReloadInvocation(throwable));
+    }
+
+    @Unique
+    private static void insignia$completeReloadInvocation(Throwable throwable) {
+        int depthAfter = INSIGNIA_RELOAD_DEPTH.decrementAndGet();
+        if (depthAfter > 0) {
+            return;
+        }
+        INSIGNIA_RELOAD_DEPTH.set(0);
+        long start = INSIGNIA_RELOAD_START_NS.getAndSet(0L);
+        long durationNs = start > 0L ? Math.max(0L, System.nanoTime() - start) : 0L;
+        DiagnoseOrchestrator.onResourceReloadEnd(durationNs);
+        if (throwable == null) {
+            TaggerMod.LOGGER.info("[Diagnose][JFR] Resource reload END durationNs={}", durationNs);
+        } else {
+            TaggerMod.LOGGER.warn("[Diagnose][JFR] Resource reload END with error durationNs={}", durationNs, throwable);
+        }
     }
 }

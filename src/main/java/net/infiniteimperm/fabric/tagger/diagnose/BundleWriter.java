@@ -10,16 +10,18 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 public final class BundleWriter {
     private static final long TRACE_ETL_SHARE_MAX_BYTES = 3_435_973_836L; // 3.2 GiB
+    private static final long LARGE_PROFILE_SPLIT_THRESHOLD_BYTES = 128L * 1024L * 1024L;
     public static Path writeSystemInfo(
         Path outFile,
         DiagnoseOrchestrator.Mode mode,
@@ -223,13 +225,15 @@ public final class BundleWriter {
         List<String> notes,
         long maxZipBytes,
         int maxParts) throws IOException {
-        Set<Path> selectedSet = new LinkedHashSet<>();
+        Set<Path> requiredSet = new LinkedHashSet<>();
         for (Path req : required) {
             if (!Files.exists(req)) {
                 throw new IOException("Missing required artifact: " + req.toAbsolutePath());
             }
-            selectedSet.add(req);
+            requiredSet.add(req);
         }
+
+        Set<Path> optionalSet = new LinkedHashSet<>();
         for (Path opt : optional) {
             if (!Files.exists(opt)) {
                 continue;
@@ -245,42 +249,34 @@ public final class BundleWriter {
                 || relText.startsWith("results/trace.etl.embeddedpdbs/")) {
                 continue;
             }
-            selectedSet.add(opt);
+            optionalSet.add(opt);
         }
 
-        List<Path> files = new ArrayList<>(selectedSet);
-        files.sort(Comparator.comparingLong(BundleWriter::safeSize).reversed());
+        List<Path> requiredFiles = new ArrayList<>(requiredSet);
+        requiredFiles.sort((a, b) -> Long.compare(safeSize(b), safeSize(a)));
+        List<Path> optionalFiles = new ArrayList<>(optionalSet);
+        optionalFiles.sort((a, b) -> Long.compare(safeSize(b), safeSize(a)));
 
         List<List<Path>> bins = new ArrayList<>();
-        List<Long> binSizes = new ArrayList<>();
+        List<Path> current = new ArrayList<>();
         List<Path> skipped = new ArrayList<>();
-        for (Path file : files) {
-            long size = safeSize(file);
-            String relText = runDir.relativize(file).toString().replace('\\', '/').toLowerCase(Locale.ROOT);
-            boolean isTraceEtl = relText.equals("results/trace.etl") || relText.equals("trace.etl");
-            if (size > maxZipBytes && !isTraceEtl) {
-                skipped.add(file);
-                continue;
+
+        for (Path file : requiredFiles) {
+            if (shouldForceLargeProfilerSplit(runDir, file) && !current.isEmpty()) {
+                bins.add(new ArrayList<>(current));
+                current.clear();
             }
-            boolean placed = false;
-            for (int i = 0; i < bins.size(); i++) {
-                if (binSizes.get(i) + size <= maxZipBytes) {
-                    bins.get(i).add(file);
-                    binSizes.set(i, binSizes.get(i) + size);
-                    placed = true;
-                    break;
-                }
+            packByActualZipSize(runDir, file, true, bins, current, skipped, notes, maxZipBytes, maxParts);
+            if (shouldForceLargeProfilerSplit(runDir, file) && !current.isEmpty()) {
+                bins.add(new ArrayList<>(current));
+                current.clear();
             }
-            if (!placed) {
-                if (bins.size() < maxParts) {
-                    List<Path> newBin = new ArrayList<>();
-                    newBin.add(file);
-                    bins.add(newBin);
-                    binSizes.add(size);
-                } else {
-                    skipped.add(file);
-                }
-            }
+        }
+        for (Path file : optionalFiles) {
+            packByActualZipSize(runDir, file, false, bins, current, skipped, notes, maxZipBytes, maxParts);
+        }
+        if (!current.isEmpty()) {
+            bins.add(new ArrayList<>(current));
         }
 
         List<Path> out = new ArrayList<>();
@@ -289,25 +285,100 @@ public final class BundleWriter {
                 ? zipBaseName + ".zip"
                 : zipBaseName + "-part" + (i + 1) + ".zip";
             Path zipPath = runDir.resolve(name);
-            try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zipPath))) {
-                for (Path file : bins.get(i)) {
-                    if (!Files.exists(file)) {
-                        continue;
-                    }
-                    Path relative = runDir.relativize(file);
-                    zos.putNextEntry(new ZipEntry(relative.toString().replace('\\', '/')));
-                    Files.copy(file, zos);
-                    zos.closeEntry();
-                }
-            }
+            writeZip(runDir, zipPath, bins.get(i));
             out.add(zipPath);
-            notes.add("Created share zip: " + zipPath.getFileName());
+            long zipSize = safeSize(zipPath);
+            notes.add("Created share zip: " + zipPath.getFileName() + " (" + zipSize + " bytes)");
+            if (zipSize > maxZipBytes) {
+                notes.add("Share zip exceeds target size cap: " + zipPath.getFileName() + " > " + maxZipBytes + " bytes.");
+            }
         }
 
         if (!skipped.isEmpty()) {
             notes.add("Skipped " + skipped.size() + " file(s) from share zips due size cap/part limit.");
         }
         return out;
+    }
+
+    private static void packByActualZipSize(
+        Path runDir,
+        Path file,
+        boolean required,
+        List<List<Path>> bins,
+        List<Path> current,
+        List<Path> skipped,
+        List<String> notes,
+        long maxZipBytes,
+        int maxParts) throws IOException {
+        if (current.isEmpty()) {
+            if (!required && maxParts > 0 && bins.size() >= maxParts) {
+                skipped.add(file);
+                return;
+            }
+            current.add(file);
+            long onlySize = estimateZipSize(runDir, current);
+            if (onlySize > maxZipBytes) {
+                notes.add("Single-file zip exceeds size cap: " + runDir.relativize(file) + " => " + onlySize + " bytes.");
+            }
+            return;
+        }
+
+        List<Path> trial = new ArrayList<>(current);
+        trial.add(file);
+        long trialSize = estimateZipSize(runDir, trial);
+        if (trialSize <= maxZipBytes) {
+            current.add(file);
+            return;
+        }
+
+        if (!required && maxParts > 0 && bins.size() + 1 >= maxParts) {
+            skipped.add(file);
+            return;
+        }
+
+        bins.add(new ArrayList<>(current));
+        current.clear();
+        current.add(file);
+        long onlySize = estimateZipSize(runDir, current);
+        if (onlySize > maxZipBytes) {
+            notes.add("Single-file zip exceeds size cap: " + runDir.relativize(file) + " => " + onlySize + " bytes.");
+        }
+    }
+
+    private static boolean shouldForceLargeProfilerSplit(Path runDir, Path file) {
+        String rel = runDir.relativize(file).toString().replace('\\', '/').toLowerCase(Locale.ROOT);
+        boolean target = rel.endsWith("/recording.jfr") || rel.equals("recording.jfr")
+            || rel.endsWith("/presentmon.csv") || rel.equals("presentmon.csv");
+        return target && safeSize(file) >= LARGE_PROFILE_SPLIT_THRESHOLD_BYTES;
+    }
+
+    private static long estimateZipSize(Path runDir, List<Path> files) throws IOException {
+        Path tmp = Files.createTempFile("insignia-zip-estimate-", ".zip");
+        try {
+            writeZip(runDir, tmp, files);
+            return Files.size(tmp);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    private static void writeZip(Path runDir, Path zipPath, List<Path> files) throws IOException {
+        // Preserve insertion order while de-duplicating.
+        Map<Path, Boolean> unique = new LinkedHashMap<>();
+        for (Path file : files) {
+            unique.put(file, Boolean.TRUE);
+        }
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zipPath))) {
+            for (Path file : unique.keySet()) {
+                if (!Files.exists(file)) {
+                    continue;
+                }
+                Path relative = runDir.relativize(file);
+                zos.putNextEntry(new ZipEntry(relative.toString().replace('\\', '/')));
+                Files.copy(file, zos);
+                zos.closeEntry();
+            }
+        }
     }
 
     private static long safeSize(Path path) {
