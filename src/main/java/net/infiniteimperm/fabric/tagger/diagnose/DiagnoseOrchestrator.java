@@ -63,6 +63,7 @@ public final class DiagnoseOrchestrator {
     private static final Pattern SPARK_URL_PATTERN = Pattern.compile("(https://spark\\.lucko\\.me/[A-Za-z0-9]+)");
     private static final int SPARK_FETCH_RETRIES = 3;
     private static final long SPARK_FETCH_RETRY_BACKOFF_MS = 1500L;
+    private static final int NSYS_PROFILE_BUFFER_SECONDS = 15;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "insignia-diagnose");
@@ -76,6 +77,7 @@ public final class DiagnoseOrchestrator {
     private volatile Instant sparkDispatchAt;
     private volatile String sparkUrlFromChat;
     private volatile Instant sparkUrlCapturedAt;
+    private volatile long nsysTimedLaunchMs;
 
     private DiagnoseOrchestrator() {
     }
@@ -333,6 +335,7 @@ public final class DiagnoseOrchestrator {
             sparkDispatchAt = null;
             sparkUrlFromChat = null;
             sparkUrlCapturedAt = null;
+            nsysTimedLaunchMs = 0L;
             runRootDir = createRunDir();
             runDir = runRootDir.resolve("results");
             Files.createDirectories(runDir);
@@ -478,8 +481,9 @@ public final class DiagnoseOrchestrator {
             long started = System.currentTimeMillis();
             long captureMs = captureSeconds * 1000L;
             // Deadline by which the timed-profile nsys process should have written its .nsys-rep.
-            // nsys --duration is set to captureSeconds+15, so it finishes ~15s after capture ends.
-            long nsysTimedDeadline = started + (long)(captureSeconds + 15) * 1000L;
+            // nsys --duration is set to captureSeconds+NSYS_PROFILE_BUFFER_SECONDS, so it finishes
+            // that many seconds after capture ends; the wait block below also guarantees a 30s floor.
+            long nsysTimedDeadline = computeNsysTimedDeadlineMs(started, nsysTimedLaunchMs, captureSeconds);
             while (System.currentTimeMillis() - started < captureMs) {
                 Thread.sleep(250L);
             }
@@ -546,7 +550,9 @@ public final class DiagnoseOrchestrator {
             }
             if (nsysWasTimedProfile) {
                 Path nsysRep = runDir.resolve("nsys-report.nsys-rep");
-                long nsysWaitDeadline = nsysTimedDeadline + 5_000L; // 5s grace past expected finish
+                // Ensure at least 30s of actual waiting from this point regardless of how long
+                // post-capture exports took; nsys can take 10-20s to write its report after profiling ends.
+                long nsysWaitDeadline = Math.max(nsysTimedDeadline + 5_000L, System.currentTimeMillis() + 30_000L);
                 log(latestLog, "Waiting for nsys timed profile report (deadline in " + Math.max(0, nsysWaitDeadline - System.currentTimeMillis()) + "ms)...");
                 while (!Files.exists(nsysRep) && System.currentTimeMillis() < nsysWaitDeadline) {
                     Thread.sleep(500L);
@@ -705,6 +711,7 @@ public final class DiagnoseOrchestrator {
             sparkDispatchAt = null;
             sparkUrlFromChat = null;
             sparkUrlCapturedAt = null;
+            nsysTimedLaunchMs = 0L;
         }
     }
 
@@ -713,6 +720,14 @@ public final class DiagnoseOrchestrator {
             return NsysStartMode.NOT_STARTED;
         }
         try {
+            cleanupStaleNsysAgents(notes);
+            // Default to low-overhead timed profile mode to minimize in-game impact.
+            if (launchNsysTimedProfileConsole(report, runDir, logBaseFile, notes, captureSeconds)) {
+                notes.add("nsys using low-overhead timed profile mode.");
+                announceStarted("Nsight Systems");
+                return NsysStartMode.TIMED_PROFILE;
+            }
+
             Path out = runDir.resolve("nsys-report");
             Path stdout = replaceSuffix(logBaseFile, ".stdout.log");
             Path stderr = replaceSuffix(logBaseFile, ".stderr.log");
@@ -826,24 +841,130 @@ public final class DiagnoseOrchestrator {
         try {
             Path stdout = replaceSuffix(logBaseFile, "-profile-console.stdout.log");
             Path stderr = replaceSuffix(logBaseFile, "-profile-console.stderr.log");
+            Path childStdout = replaceSuffix(logBaseFile, "-profile-child.stdout.log");
+            Path childStderr = replaceSuffix(logBaseFile, "-profile-child.stderr.log");
+            try {
+                Files.deleteIfExists(childStdout);
+                Files.deleteIfExists(childStderr);
+            } catch (Exception ignored) {
+            }
             String exe = report.nsys.path.toAbsolutePath().toString().replace("'", "''");
             String out = runDir.resolve("nsys-report").toAbsolutePath().toString().replace("'", "''");
-            // Profile duration is tied to the requested diagnose window plus a small buffer so the
-            // .nsys-rep is written before (or shortly after) bundle export begins.
-            int nsysDuration = captureSeconds + 15;
+            String childOut = childStdout.toAbsolutePath().toString().replace("'", "''");
+            String childErr = childStderr.toAbsolutePath().toString().replace("'", "''");
+            List<String> profileArgs = buildNsysLowOverheadProfileArgs(out, captureSeconds);
+            int nsysDuration = nsysDurationSeconds(captureSeconds);
+
+            ElevatedHelper helper = elevatedHelper;
+            if (helper == null || !helper.isReady()) {
+                helper = ensureElevatedHelper(runDir, notes);
+            }
+            if (helper != null && helper.isReady()) {
+                ElevatedHelper.CommandResult result = helper.runCommand(
+                    report.nsys.path.toAbsolutePath().toString(),
+                    profileArgs,
+                    runDir.toAbsolutePath().toString(),
+                    childStdout.toAbsolutePath().toString(),
+                    childStderr.toAbsolutePath().toString(),
+                    30_000L,
+                    false
+                );
+                notes.add("nsys low-overhead timed profile (elevated helper) exitCode=" + result.exitCode()
+                    + " timedOut=" + result.timedOut()
+                    + " duration=" + nsysDuration + "s"
+                    + " error=" + result.error());
+                notes.add("nsys child logs: " + childStdout.getFileName() + ", " + childStderr.getFileName());
+                boolean ok = !result.timedOut() && result.exitCode() == 0;
+                if (ok) {
+                    nsysTimedLaunchMs = System.currentTimeMillis();
+                    return true;
+                }
+                notes.add("nsys elevated helper launch failed, falling back to non-elevated launcher.");
+            }
+
+            StringBuilder argBuilder = new StringBuilder();
+            for (int i = 0; i < profileArgs.size(); i++) {
+                if (i > 0) {
+                    argBuilder.append(",");
+                }
+                argBuilder.append("'").append(profileArgs.get(i).replace("'", "''")).append("'");
+            }
             String script =
-                quickEditDisableScript() +
                 "$ErrorActionPreference='Stop'; " +
-                "$a=@('profile','--trace=none','--sample=none','--cpuctxsw=none','--duration','" + nsysDuration + "','--force-overwrite=true','-o','" + out + "','cmd','/c','timeout /t " + (nsysDuration + 1) + " >nul'); " +
-                "$p=Start-Process -FilePath '" + exe + "' -ArgumentList $a -WindowStyle Minimized -PassThru; " +
+                "$a=@(" + argBuilder + "); " +
+                "$p=Start-Process -FilePath '" + exe + "' -ArgumentList $a -WindowStyle Minimized -RedirectStandardOutput '" + childOut + "' -RedirectStandardError '" + childErr + "' -PassThru; " +
                 "if ($null -eq $p) { exit 1 }; exit 0";
             List<String> cmd = List.of("powershell.exe", "-NoProfile", "-Command", script);
             ProcessRunner.ProcessResult result = ProcessRunner.run(cmd, runDir, stdout, stderr, Duration.ofSeconds(20), false);
-            notes.add("nsys timed profile console fallback exitCode=" + result.exitCode() + " timedOut=" + result.timedOut() + " duration=" + nsysDuration + "s");
-            return !result.timedOut() && result.exitCode() == 0;
+            notes.add("nsys low-overhead timed profile (non-elevated fallback) exitCode=" + result.exitCode() + " timedOut=" + result.timedOut() + " duration=" + nsysDuration + "s");
+            notes.add("nsys child logs: " + childStdout.getFileName() + ", " + childStderr.getFileName());
+            boolean ok = !result.timedOut() && result.exitCode() == 0;
+            if (ok) {
+                nsysTimedLaunchMs = System.currentTimeMillis();
+            }
+            return ok;
         } catch (Exception e) {
             notes.add("nsys timed profile console fallback failed: " + e.getMessage());
             return false;
+        }
+    }
+
+    static long computeNsysTimedDeadlineMs(long captureLoopStartMs, long nsysLaunchMs, int captureSeconds) {
+        long base = nsysLaunchMs > 0L ? nsysLaunchMs : captureLoopStartMs;
+        return base + (long) nsysDurationSeconds(captureSeconds) * 1000L;
+    }
+
+    static int nsysDurationSeconds(int captureSeconds) {
+        return Math.max(5, captureSeconds + NSYS_PROFILE_BUFFER_SECONDS);
+    }
+
+    static List<String> buildNsysLowOverheadProfileArgs(String out, int captureSeconds) {
+        int nsysDuration = nsysDurationSeconds(captureSeconds);
+        return List.of(
+            "profile",
+            "--trace=wddm",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--duration",
+            Integer.toString(nsysDuration),
+            "--force-overwrite=true",
+            "-o",
+            out,
+            "cmd",
+            "/c",
+            "timeout /t " + (nsysDuration + 1) + " >nul"
+        );
+    }
+
+    private void cleanupStaleNsysAgents(List<String> notes) {
+        int found = 0;
+        int terminated = 0;
+        for (ProcessHandle handle : ProcessHandle.allProcesses().toList()) {
+            try {
+                ProcessHandle.Info info = handle.info();
+                String cmd = info.commandLine().orElse("");
+                String args = String.join(" ", info.arguments().orElse(new String[0]));
+                String combined = (cmd + " " + args).toLowerCase(Locale.ROOT);
+                if (!combined.contains("nsys.exe") || !combined.contains("--start-agent")) {
+                    continue;
+                }
+                found++;
+                handle.destroy();
+                try {
+                    handle.onExit().get(2, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+                if (handle.isAlive()) {
+                    handle.destroyForcibly();
+                }
+                if (!handle.isAlive()) {
+                    terminated++;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (found > 0) {
+            notes.add("nsys stale agent cleanup: found=" + found + " terminated=" + terminated);
         }
     }
 
