@@ -364,6 +364,7 @@ public final class DiagnoseOrchestrator {
             Path recordingJfr = plan.jfr ? runDir.resolve("recording.jfr") : null;
             Path badFrames = (plan.jfr && plan.presentMon) ? runDir.resolve("bad_frames.json") : null;
             Path systemInfo = runDir.resolve("system_info.json");
+            Path deviceDetails = runDir.resolve("device-details.json");
             Path readme = runDir.resolve("README_ANALYZE.txt");
 
             if (plan.presentMon) {
@@ -580,11 +581,12 @@ public final class DiagnoseOrchestrator {
                 announceExportIfExists("process contention", contentionCsv);
             }
 
-            log(latestLog, "Writing system_info.json and README_ANALYZE.txt...");
+            log(latestLog, "Writing system_info.json, device-details.json, and README_ANALYZE.txt...");
             long targetPid = presentMon != null ? presentMon.targetPid() : ProcessHandle.current().pid();
             Instant startWall = jfr != null ? jfr.startWall() : Instant.now();
             Instant endWall = jfr != null ? jfr.endWall() : Instant.now();
             BundleWriter.writeSystemInfo(systemInfo, mode, report, targetPid, startWall, endWall);
+            BundleWriter.writeDeviceDetails(deviceDetails, startWall, endWall);
             if (plan.nsys || plan.wpr) {
                 BundleWriter.includeFullModeFiles(runDir, notes);
             }
@@ -604,6 +606,7 @@ public final class DiagnoseOrchestrator {
                 required.add(badFrames);
             }
             required.add(systemInfo);
+            required.add(deviceDetails);
             required.add(readme);
             required.add(latestLog);
             if (plan.perfCounters) {
@@ -1429,8 +1432,8 @@ public final class DiagnoseOrchestrator {
 
     private void sendFinalSummary(boolean success, Path runDir, List<String> working, List<String> failed, String sparkUrl) {
         ChatUi.info("==================");
-        ChatUi.info((success ? "Success: " : "Failed: ") + joinOrNone(working));
-        ChatUi.info("failed: " + joinOrNone(failed));
+        ChatUi.info((success ? "Completed: " : "Captured before failure: ") + joinOrNone(working));
+        ChatUi.info("Missing or failed: " + joinOrNone(failed));
         if (sparkUrl == null || sparkUrl.isBlank() || "not available".equalsIgnoreCase(sparkUrl)) {
             ChatUi.info("spark data: not available");
         } else {

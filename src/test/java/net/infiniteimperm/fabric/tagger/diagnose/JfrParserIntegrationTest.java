@@ -66,4 +66,34 @@ class JfrParserIntegrationTest {
             assertTrue(expected.getMessage().contains("missing frame time column"));
         }
     }
+
+    @Test
+    void ignoresPresentMonFramesOutsideCaptureWindow() throws Exception {
+        Path jfr = tempDir.resolve("recording-windowed.jfr");
+        Path csv = tempDir.resolve("presentmon-windowed.csv");
+        Path out = tempDir.resolve("bad_frames-windowed.json");
+
+        try (Recording recording = new Recording()) {
+            recording.start();
+            recording.stop();
+            recording.dump(jfr);
+        }
+
+        Instant start = Instant.parse("2026-03-24T12:00:00Z");
+        Instant end = start.plusMillis(100);
+        String csvText = "TimeInSeconds,MsBetweenPresents\n" +
+            "0.010,10.0\n" +
+            "0.050,25.0\n" +
+            "0.105,40.0\n" +
+            "0.250,40.0\n";
+        Files.writeString(csv, csvText, StandardCharsets.UTF_8);
+
+        new JfrParser().parse(jfr, csv, out, start, end);
+
+        String json = Files.readString(out, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"total_frames\": 2"));
+        assertTrue(json.contains("\"bad_frames\": 1"));
+        assertTrue(json.contains("\"ignored_out_of_window_frames\": 2"));
+        assertTrue(!json.contains("\"frame_ms\": 40.000"));
+    }
 }

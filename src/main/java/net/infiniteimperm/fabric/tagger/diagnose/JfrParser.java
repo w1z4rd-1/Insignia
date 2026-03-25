@@ -25,7 +25,8 @@ public final class JfrParser {
     private static final int TOP_STACKS = 20;
 
     public void parse(Path jfrFile, Path presentMonCsv, Path outJson, Instant captureStart, Instant captureEnd) throws IOException {
-        List<FrameRecord> frames = readPresentMon(presentMonCsv, captureStart);
+        PresentMonReadResult presentMon = readPresentMon(presentMonCsv, captureStart, captureEnd);
+        List<FrameRecord> frames = presentMon.frames();
         List<EventRecord> events = readJfrEvents(jfrFile);
 
         List<FrameRecord> badFrames = new ArrayList<>();
@@ -46,7 +47,8 @@ public final class JfrParser {
         json.append("    \"start\": \"").append(captureStart).append("\",\n");
         json.append("    \"end\": \"").append(captureEnd).append("\",\n");
         json.append("    \"total_frames\": ").append(frames.size()).append(",\n");
-        json.append("    \"bad_frames\": ").append(badFrames.size()).append("\n");
+        json.append("    \"bad_frames\": ").append(badFrames.size()).append(",\n");
+        json.append("    \"ignored_out_of_window_frames\": ").append(presentMon.ignoredOutOfWindow()).append("\n");
         json.append("  },\n");
         json.append("  \"baseline\": ").append(buildBaseline(normalFrames)).append(",\n");
         json.append("  \"bad_frames\": [\n");
@@ -166,12 +168,15 @@ public final class JfrParser {
         return "{\"median_frame_ms\": " + formatDouble(median) + ", \"sample_count\": " + normalFrames.size() + "}";
     }
 
-    private List<FrameRecord> readPresentMon(Path csv, Instant captureStart) throws IOException {
+    private PresentMonReadResult readPresentMon(Path csv, Instant captureStart, Instant captureEnd) throws IOException {
         List<FrameRecord> rows = new ArrayList<>();
+        int ignoredOutOfWindow = 0;
+        long captureStartMs = captureStart.toEpochMilli();
+        long captureEndMs = captureEnd.toEpochMilli();
         try (BufferedReader reader = Files.newBufferedReader(csv, StandardCharsets.UTF_8)) {
             String headerLine = reader.readLine();
             if (headerLine == null) {
-                return rows;
+                return new PresentMonReadResult(rows, 0);
             }
             List<String> headers = parseCsvLine(headerLine);
             int frameMsCol = findHeader(headers, List.of("msbetweenpresents", "msbetweendisplaychange", "cpuframetime", "frametime", "msuntilrendercomplete"));
@@ -192,17 +197,23 @@ public final class JfrParser {
                 }
                 long tsMs;
                 if (tsCol >= 0 && cols.size() > tsCol) {
-                    tsMs = normalizeTimestampToMs(cols.get(tsCol), captureStart.toEpochMilli(), index, frameMs);
+                    tsMs = normalizeTimestampToMs(cols.get(tsCol), captureStartMs, index, frameMs);
                 } else {
-                    tsMs = captureStart.toEpochMilli() + (long) (index * frameMs);
+                    tsMs = captureStartMs + (long) (index * frameMs);
                 }
-                long windowStart = tsMs - (long) frameMs;
-                rows.add(new FrameRecord(index, tsMs, frameMs, windowStart, tsMs));
+                if (tsMs < captureStartMs || tsMs > captureEndMs) {
+                    ignoredOutOfWindow++;
+                    index++;
+                    continue;
+                }
+                long windowStart = Math.max(captureStartMs, tsMs - (long) frameMs);
+                long windowEnd = Math.min(captureEndMs, tsMs);
+                rows.add(new FrameRecord(index, tsMs, frameMs, windowStart, windowEnd));
                 index++;
             }
         }
-        TaggerMod.LOGGER.info("[Diagnose][Parser] PresentMon frames={} badThreshold={}ms", rows.size(), BAD_FRAME_MS);
-        return rows;
+        TaggerMod.LOGGER.info("[Diagnose][Parser] PresentMon frames={} ignoredOutOfWindow={} badThreshold={}ms", rows.size(), ignoredOutOfWindow, BAD_FRAME_MS);
+        return new PresentMonReadResult(rows, ignoredOutOfWindow);
     }
 
     private List<EventRecord> readJfrEvents(Path jfr) throws IOException {
@@ -325,5 +336,8 @@ public final class JfrParser {
     }
 
     private record EventRecord(String type, long startMs, long endMs, long durationMs, String stack, long allocationBytes) {
+    }
+
+    private record PresentMonReadResult(List<FrameRecord> frames, int ignoredOutOfWindow) {
     }
 }

@@ -3,8 +3,15 @@
   "package": "net.infiniteimperm.fabric.tagger.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "ChunkRebuildTaskMixin",
     "CommandInterceptorMixin",
+    "NativeImageMixin",
+    "ShaderProgramMixin",
+    "SodiumChunkMeshingTaskMixin",
+    "SodiumRenderRegionManagerMixin",
+    "SodiumShaderProgramMixin",
     "TotemPopMixin",
+    "VertexBufferMixin",
     "MinecraftClientReloadMixin"
   ],
   "injectors": {

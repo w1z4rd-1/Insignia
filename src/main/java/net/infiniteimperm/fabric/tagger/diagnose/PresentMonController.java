@@ -16,6 +16,8 @@ import java.util.stream.Collectors;
 public final class PresentMonController {
     private static final int DEFAULT_TIMED_CAPTURE_SECONDS = 120;
     private static final String SESSION_NAME = "InsigniaPresentMon";
+    private static final Duration STARTUP_PROBE_TIMEOUT = Duration.ofSeconds(4);
+    private static final long STARTUP_PROBE_POLL_MS = 200L;
     private final ToolDetection.ToolInfo tool;
     private final Path workDir;
     private final Path csvPath;
@@ -41,59 +43,41 @@ public final class PresentMonController {
         }
 
         targetPid = ProcessHandle.current().pid();
-        List<String> command = new ArrayList<>();
-        command.add(tool.path.toString());
-        command.add("--output_file");
-        command.add(csvPath.toAbsolutePath().toString());
-        command.add("--stop_existing_session");
-        command.add("--delay");
-        command.add("2");
-        command.add("--timed");
-        command.add(Integer.toString(timedCaptureSeconds));
-        command.add("--terminate_after_timed");
-        command.add("--session_name");
-        command.add(SESSION_NAME);
+        List<String> command = baseTimedCommand();
         command.add("--process_id");
         command.add(Long.toString(targetPid));
-        command.add("--set_circular_buffer_size");
-        command.add("131072");
-        command.add("--no_console_stats");
 
         TaggerMod.LOGGER.info("[Diagnose][PresentMon] Command: {}", command);
-        process = ProcessRunner.start(command, workDir, stdoutLog, stderrLog);
-        Thread.sleep(750L);
-        if (process == null || !process.isAlive()) {
+        LaunchOutcome firstLaunch = startDirect(command);
+        if (firstLaunch == LaunchOutcome.STARTED) {
+            return;
+        }
+        if (firstLaunch == LaunchOutcome.ACCESS_DENIED) {
+            TaggerMod.LOGGER.warn("[Diagnose][PresentMon] PID targeting hit access denied during startup. Triggering UAC elevation fallback.");
+            ChatUi.warn("PresentMon requires elevation. Approve the UAC prompt to continue diagnostics.");
+            startElevatedTimedCapture();
+            return;
+        }
+
+        if (firstLaunch == LaunchOutcome.EXITED) {
             TaggerMod.LOGGER.warn("[Diagnose][PresentMon] PID targeting failed, retrying with process_name javaw.exe");
-            command = new ArrayList<>();
-            command.add(tool.path.toString());
-            command.add("--output_file");
-            command.add(csvPath.toAbsolutePath().toString());
-            command.add("--stop_existing_session");
-            command.add("--delay");
-            command.add("2");
-            command.add("--timed");
-            command.add(Integer.toString(timedCaptureSeconds));
-            command.add("--terminate_after_timed");
-            command.add("--session_name");
-            command.add(SESSION_NAME);
+            command = baseTimedCommand();
             command.add("--process_name");
             command.add("javaw.exe");
-            command.add("--set_circular_buffer_size");
-            command.add("131072");
-            command.add("--no_console_stats");
-            process = ProcessRunner.start(command, workDir, stdoutLog, stderrLog);
-            Thread.sleep(750L);
-            if (process == null || !process.isAlive()) {
-                String combined = readCombinedLogs();
-                if (isAccessDenied(combined)) {
-                    TaggerMod.LOGGER.warn("[Diagnose][PresentMon] Access denied on direct launch. Triggering UAC elevation fallback.");
-                    ChatUi.warn("PresentMon requires elevation. Approve the UAC prompt to continue diagnostics.");
-                    startElevatedTimedCapture();
-                    return;
-                }
-                throw new IllegalStateException("PresentMon process exited immediately after launch. Check presentmon.stderr.log in the run folder.");
+            LaunchOutcome fallbackLaunch = startDirect(command);
+            if (fallbackLaunch == LaunchOutcome.STARTED) {
+                return;
             }
+            if (fallbackLaunch == LaunchOutcome.ACCESS_DENIED) {
+                TaggerMod.LOGGER.warn("[Diagnose][PresentMon] Access denied on direct launch. Triggering UAC elevation fallback.");
+                ChatUi.warn("PresentMon requires elevation. Approve the UAC prompt to continue diagnostics.");
+                startElevatedTimedCapture();
+                return;
+            }
+            throw new IllegalStateException("PresentMon process exited during startup. Check presentmon.stderr.log in the run folder.");
         }
+
+        throw new IllegalStateException("PresentMon failed to launch. Check presentmon.stderr.log in the run folder.");
     }
 
     public void stop() throws Exception {
@@ -114,6 +98,49 @@ public final class PresentMonController {
 
     public long targetPid() {
         return targetPid;
+    }
+
+    private List<String> baseTimedCommand() {
+        List<String> command = new ArrayList<>();
+        command.add(tool.path.toString());
+        command.add("--output_file");
+        command.add(csvPath.toAbsolutePath().toString());
+        command.add("--stop_existing_session");
+        command.add("--delay");
+        command.add("2");
+        command.add("--timed");
+        command.add(Integer.toString(timedCaptureSeconds));
+        command.add("--terminate_after_timed");
+        command.add("--session_name");
+        command.add(SESSION_NAME);
+        command.add("--set_circular_buffer_size");
+        command.add("131072");
+        command.add("--no_console_stats");
+        return command;
+    }
+
+    private LaunchOutcome startDirect(List<String> command) throws Exception {
+        process = ProcessRunner.start(command, workDir, stdoutLog, stderrLog);
+        long deadline = System.currentTimeMillis() + STARTUP_PROBE_TIMEOUT.toMillis();
+        while (System.currentTimeMillis() < deadline) {
+            String combined = readCombinedLogs();
+            if (isAccessDenied(combined)) {
+                ProcessRunner.stop(process, Duration.ofSeconds(1));
+                process = null;
+                return LaunchOutcome.ACCESS_DENIED;
+            }
+            if (process == null || !process.isAlive()) {
+                return LaunchOutcome.EXITED;
+            }
+            Thread.sleep(STARTUP_PROBE_POLL_MS);
+        }
+        String combined = readCombinedLogs();
+        if (isAccessDenied(combined)) {
+            ProcessRunner.stop(process, Duration.ofSeconds(1));
+            process = null;
+            return LaunchOutcome.ACCESS_DENIED;
+        }
+        return process != null && process.isAlive() ? LaunchOutcome.STARTED : LaunchOutcome.EXITED;
     }
 
     private void startElevatedTimedCapture() throws Exception {
@@ -173,7 +200,7 @@ public final class PresentMonController {
         }
     }
 
-    private boolean isAccessDenied(String combinedLower) {
+    static boolean isAccessDenied(String combinedLower) {
         return combinedLower.contains("access denied")
             || combinedLower.contains("requires either administrative privileges")
             || combinedLower.contains("performance log users");
@@ -253,5 +280,11 @@ public final class PresentMonController {
             return "";
         }
         return value.replace("'", "''");
+    }
+
+    private enum LaunchOutcome {
+        STARTED,
+        EXITED,
+        ACCESS_DENIED
     }
 }

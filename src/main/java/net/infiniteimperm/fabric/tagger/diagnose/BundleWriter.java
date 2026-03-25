@@ -16,12 +16,17 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 public final class BundleWriter {
     private static final long TRACE_ETL_SHARE_MAX_BYTES = 3_435_973_836L; // 3.2 GiB
     private static final long LARGE_PROFILE_SPLIT_THRESHOLD_BYTES = 128L * 1024L * 1024L;
+    private static final Pattern POWER_PLAN_PATTERN = Pattern.compile("GUID:\\s*([0-9a-fA-F\\-]+)\\s*\\((.+)\\)");
+
     public static Path writeSystemInfo(
         Path outFile,
         DiagnoseOrchestrator.Mode mode,
@@ -86,6 +91,11 @@ public final class BundleWriter {
         sb.append("    \"typeperf\": ").append(detection.typeperf != null && detection.typeperf.found).append(",\n");
         sb.append("    \"nvidia_smi\": ").append(detection.nvidiaSmi != null && detection.nvidiaSmi.found).append("\n");
         sb.append("  },\n");
+        sb.append("  \"diagnose_capabilities\": {\n");
+        sb.append("    \"gpu_metadata_source\": \"powershell_cim_csv\",\n");
+        sb.append("    \"execution_samples_requested\": ").append(detection.jfrAvailable).append(",\n");
+        sb.append("    \"renderer_batch_hooks_wired\": true\n");
+        sb.append("  },\n");
         sb.append("  \"mode\": \"").append(mode.name().toLowerCase(Locale.ROOT)).append("\",\n");
         sb.append("  \"mods\": [\n");
         List<String> mods = new ArrayList<>();
@@ -94,6 +104,123 @@ public final class BundleWriter {
         for (int i = 0; i < mods.size(); i++) {
             sb.append("    \"").append(escape(mods.get(i))).append("\"");
             if (i + 1 < mods.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("  ]\n");
+        sb.append("}\n");
+        Files.writeString(outFile, sb.toString(), StandardCharsets.UTF_8);
+        return outFile;
+    }
+
+    public static Path writeDeviceDetails(Path outFile, Instant captureStart, Instant captureEnd) throws IOException {
+        DeviceDetails details = DeviceDetails.query();
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n");
+        sb.append("  \"timestamp\": \"").append(Instant.now()).append("\",\n");
+        sb.append("  \"capture_start\": \"").append(captureStart).append("\",\n");
+        sb.append("  \"capture_end\": \"").append(captureEnd).append("\",\n");
+        sb.append("  \"graphics\": {\n");
+        sb.append("    \"adapters\": [\n");
+        for (int i = 0; i < details.adapters.size(); i++) {
+            DetailedGpuAdapter gpu = details.adapters.get(i);
+            sb.append("      {")
+                .append("\"name\": \"").append(escape(gpu.name)).append("\", ")
+                .append("\"driver_version\": \"").append(escape(gpu.driverVersion)).append("\", ")
+                .append("\"video_processor\": \"").append(escape(gpu.videoProcessor)).append("\", ")
+                .append("\"driver_model\": \"").append(escape(gpu.driverModel)).append("\", ")
+                .append("\"vram_mb\": ").append(gpu.vramMb)
+                .append("}");
+            if (i + 1 < details.adapters.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("    ],\n");
+        sb.append("    \"displays\": [\n");
+        for (int i = 0; i < details.displays.size(); i++) {
+            DisplayDevice display = details.displays.get(i);
+            sb.append("      {")
+                .append("\"name\": \"").append(escape(display.name)).append("\", ")
+                .append("\"width\": ").append(display.width).append(", ")
+                .append("\"height\": ").append(display.height)
+                .append("}");
+            if (i + 1 < details.displays.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("    ],\n");
+        sb.append("    \"power_plan\": ");
+        appendPowerPlanJson(sb, details.powerPlan);
+        sb.append(",\n");
+        sb.append("    \"user_gpu_preferences\": [\n");
+        for (int i = 0; i < details.gpuPreferences.size(); i++) {
+            GpuPreference pref = details.gpuPreferences.get(i);
+            sb.append("      {")
+                .append("\"application\": \"").append(escape(pref.application)).append("\", ")
+                .append("\"preference\": \"").append(escape(pref.preference)).append("\"")
+                .append("}");
+            if (i + 1 < details.gpuPreferences.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("    ],\n");
+        sb.append("    \"settings\": ");
+        appendGraphicsSettingsJson(sb, details.settings);
+        sb.append("\n");
+        sb.append("  },\n");
+        sb.append("  \"devices\": {\n");
+        sb.append("    \"counts_by_class\": {\n");
+        int classIndex = 0;
+        for (Map.Entry<String, Integer> entry : details.deviceCountsByClass.entrySet()) {
+            sb.append("      \"").append(escape(entry.getKey())).append("\": ").append(entry.getValue());
+            if (++classIndex < details.deviceCountsByClass.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("    },\n");
+        sb.append("    \"input_devices\": [\n");
+        for (int i = 0; i < details.inputDevices.size(); i++) {
+            CompactDevice device = details.inputDevices.get(i);
+            sb.append("      {")
+                .append("\"name\": \"").append(escape(device.name)).append("\", ")
+                .append("\"class\": \"").append(escape(device.deviceClass)).append("\", ")
+                .append("\"manufacturer\": \"").append(escape(device.manufacturer)).append("\", ")
+                .append("\"status\": \"").append(escape(device.status)).append("\"")
+                .append("}");
+            if (i + 1 < details.inputDevices.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("    ],\n");
+        sb.append("    \"audio_devices\": [\n");
+        for (int i = 0; i < details.audioDevices.size(); i++) {
+            CompactDevice device = details.audioDevices.get(i);
+            sb.append("      {")
+                .append("\"name\": \"").append(escape(device.name)).append("\", ")
+                .append("\"manufacturer\": \"").append(escape(device.manufacturer)).append("\", ")
+                .append("\"status\": \"").append(escape(device.status)).append("\"")
+                .append("}");
+            if (i + 1 < details.audioDevices.size()) {
+                sb.append(",");
+            }
+            sb.append("\n");
+        }
+        sb.append("    ]\n");
+        sb.append("  },\n");
+        sb.append("  \"overlay_processes\": [\n");
+        for (int i = 0; i < details.overlayProcesses.size(); i++) {
+            OverlayProcess process = details.overlayProcesses.get(i);
+            sb.append("    {")
+                .append("\"name\": \"").append(escape(process.name)).append("\", ")
+                .append("\"count\": ").append(process.count)
+                .append("}");
+            if (i + 1 < details.overlayProcesses.size()) {
                 sb.append(",");
             }
             sb.append("\n");
@@ -117,6 +244,7 @@ public final class BundleWriter {
         sb.append("- windows_hardware_counters.csv\n");
         sb.append("- process_contention.csv\n");
         sb.append("- system_info.json\n");
+        sb.append("- device-details.json\n");
         sb.append("- logs/*.log\n\n");
         sb.append("Custom JFR events emitted by this mod (category: Insignia):\n");
         sb.append("- insignia.HudFrameStart(frameId, nanoTime, wallMillis)\n");
@@ -134,7 +262,7 @@ public final class BundleWriter {
         sb.append("- insignia.BufferUploadBatch(frameId, uploadCount, bytes, durationNs)\n");
         sb.append("- insignia.TextureUploadBatch(frameId, uploadCount, bytes, durationNs)\n");
         sb.append("- insignia.ShaderCompileBatch(frameId, compileCount, durationNs)\n");
-        sb.append("Note: some batch events may be sparsely populated depending on active renderer hooks.\n\n");
+        sb.append("Note: renderer batch hooks aggregate uploads per frame; zero counts usually mean the path was not exercised during capture.\n\n");
         sb.append("Reference parsing behavior:\n");
         sb.append("- PresentMon interpretation should follow CapFrameX-style frame-time analysis patterns.\n");
         sb.append("- Reference implementation: https://github.com/CXWorld/CapFrameX\n");
@@ -396,6 +524,206 @@ public final class BundleWriter {
         return input.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
+    private static void appendPowerPlanJson(StringBuilder sb, PowerPlan powerPlan) {
+        if (powerPlan == null) {
+            sb.append("null");
+            return;
+        }
+        sb.append("{")
+            .append("\"guid\": \"").append(escape(powerPlan.guid)).append("\", ")
+            .append("\"name\": \"").append(escape(powerPlan.name)).append("\"")
+            .append("}");
+    }
+
+    private static void appendGraphicsSettingsJson(StringBuilder sb, GraphicsSettings settings) {
+        sb.append("{\n");
+        sb.append("      \"auto_game_mode_enabled\": ");
+        appendBooleanOrNull(sb, settings.autoGameModeEnabled);
+        sb.append(",\n");
+        sb.append("      \"game_dvr_enabled\": ");
+        appendBooleanOrNull(sb, settings.gameDvrEnabled);
+        sb.append(",\n");
+        sb.append("      \"game_dvr_fse_behavior_mode\": ");
+        appendIntegerOrNull(sb, settings.gameDvrFseBehaviorMode);
+        sb.append(",\n");
+        sb.append("      \"vrr_enabled\": ");
+        appendBooleanOrNull(sb, settings.vrrEnabled);
+        sb.append(",\n");
+        sb.append("      \"hardware_accelerated_gpu_scheduling\": \"").append(escape(settings.hagsMode)).append("\",\n");
+        sb.append("      \"tdr_level\": ");
+        appendIntegerOrNull(sb, settings.tdrLevel);
+        sb.append(",\n");
+        sb.append("      \"tdr_delay_s\": ");
+        appendIntegerOrNull(sb, settings.tdrDelaySeconds);
+        sb.append(",\n");
+        sb.append("      \"tdr_ddi_delay_s\": ");
+        appendIntegerOrNull(sb, settings.tdrDdiDelaySeconds);
+        sb.append("\n");
+        sb.append("    }");
+    }
+
+    private static void appendBooleanOrNull(StringBuilder sb, Boolean value) {
+        if (value == null) {
+            sb.append("null");
+            return;
+        }
+        sb.append(value);
+    }
+
+    private static void appendIntegerOrNull(StringBuilder sb, Integer value) {
+        if (value == null) {
+            sb.append("null");
+            return;
+        }
+        sb.append(value);
+    }
+
+    private static String runPs(String expr) {
+        try {
+            String script = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + expr;
+            ProcessBuilder pb = new ProcessBuilder(
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script);
+            Process process = pb.start();
+            boolean finished = process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                return "unknown";
+            }
+            String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            String err = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (process.exitValue() != 0) {
+                TaggerMod.LOGGER.warn("[Diagnose][Bundle] PowerShell query failed: expr={} stderr={}", expr, err);
+                return "unknown";
+            }
+            return out.isBlank() ? "unknown" : out;
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    static List<String[]> parseGpuAdapterCsvRows(String rows) {
+        List<String[]> parsed = new ArrayList<>();
+        if (rows == null || rows.isBlank() || rows.equals("unknown")) {
+            return parsed;
+        }
+        boolean headerSkipped = false;
+        for (String row : rows.split("\\R")) {
+            if (row == null || row.isBlank()) {
+                continue;
+            }
+            if (!headerSkipped) {
+                headerSkipped = true;
+                continue;
+            }
+            List<String> parts = JfrParser.parseCsvLine(row);
+            String name = parts.size() > 0 ? parts.get(0).trim() : "unknown";
+            if (name.isBlank() || name.equalsIgnoreCase("name")) {
+                continue;
+            }
+            String driver = parts.size() > 1 ? parts.get(1).trim() : "unknown";
+            String ram = parts.size() > 2 ? parts.get(2).trim() : "";
+            parsed.add(new String[]{name, driver, ram});
+        }
+        return parsed;
+    }
+
+    static List<Map<String, String>> parseNamedCsvRows(String rows) {
+        List<Map<String, String>> parsed = new ArrayList<>();
+        if (rows == null || rows.isBlank() || rows.equals("unknown")) {
+            return parsed;
+        }
+        String[] lines = rows.split("\\R");
+        if (lines.length == 0) {
+            return parsed;
+        }
+        List<String> headers = JfrParser.parseCsvLine(lines[0]);
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            if (line == null || line.isBlank()) {
+                continue;
+            }
+            List<String> cols = JfrParser.parseCsvLine(line);
+            Map<String, String> row = new LinkedHashMap<>();
+            boolean anyValue = false;
+            for (int j = 0; j < headers.size(); j++) {
+                String header = headers.get(j).trim();
+                String value = j < cols.size() ? cols.get(j).trim() : "";
+                if (!value.isBlank()) {
+                    anyValue = true;
+                }
+                row.put(header, value);
+            }
+            if (anyValue) {
+                parsed.add(row);
+            }
+        }
+        return parsed;
+    }
+
+    static PowerPlan parsePowerPlanOutput(String output) {
+        if (output == null || output.isBlank() || output.equals("unknown")) {
+            return null;
+        }
+        Matcher matcher = POWER_PLAN_PATTERN.matcher(output.trim());
+        if (!matcher.find()) {
+            return null;
+        }
+        return new PowerPlan(matcher.group(1).trim(), matcher.group(2).trim());
+    }
+
+    static String parseGpuPreferenceValue(String rawValue) {
+        if (rawValue == null || rawValue.isBlank()) {
+            return "unknown";
+        }
+        Matcher matcher = Pattern.compile("GpuPreference=(\\d+)").matcher(rawValue);
+        if (!matcher.find()) {
+            return rawValue.trim();
+        }
+        return switch (matcher.group(1)) {
+            case "0" -> "system_default";
+            case "1" -> "power_saving";
+            case "2" -> "high_performance";
+            default -> "unknown(" + matcher.group(1) + ")";
+        };
+    }
+
+    static String parseHagsMode(String rawValue) {
+        Integer mode = parseInteger(rawValue);
+        if (mode == null) {
+            return "unknown";
+        }
+        return switch (mode) {
+            case 1 -> "disabled";
+            case 2 -> "enabled";
+            default -> "default";
+        };
+    }
+
+    private static Boolean parseBooleanFlag(String rawValue) {
+        Integer value = parseInteger(rawValue);
+        if (value == null) {
+            return null;
+        }
+        return value != 0;
+    }
+
+    private static Integer parseInteger(String rawValue) {
+        if (rawValue == null || rawValue.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(rawValue.trim());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     public static Path writeManifest(
         Path outFile,
         ToolDetection.DetectionReport detection,
@@ -483,22 +811,19 @@ public final class BundleWriter {
         }
 
         private static List<GpuAdapter> queryGpuAdapters() {
+            String rows = runPs("Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM | ConvertTo-Csv -NoTypeInformation");
+            return parseGpuAdapterCsv(rows);
+        }
+
+        static List<GpuAdapter> parseGpuAdapterCsv(String rows) {
             List<GpuAdapter> gpus = new ArrayList<>();
-            String rows = runPs("Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name)||$($_.DriverVersion)||$($_.AdapterRAM)\" }");
-            if (rows == null || rows.isBlank() || rows.equals("unknown")) {
-                return gpus;
-            }
-            for (String row : rows.split("\\R")) {
-                if (row == null || row.isBlank()) {
-                    continue;
-                }
-                String[] parts = row.split("\\|\\|", -1);
-                String name = parts.length > 0 ? parts[0].trim() : "unknown";
-                String driver = parts.length > 1 ? parts[1].trim() : "unknown";
+            for (String[] parts : BundleWriter.parseGpuAdapterCsvRows(rows)) {
+                String name = parts[0];
+                String driver = parts[1];
                 long vramMb = -1L;
-                if (parts.length > 2) {
+                if (!parts[2].isBlank()) {
                     try {
-                        vramMb = Long.parseLong(parts[2].trim()) / (1024L * 1024L);
+                        vramMb = Long.parseLong(parts[2]) / (1024L * 1024L);
                     } catch (Exception ignored) {
                         vramMb = -1L;
                     }
@@ -527,27 +852,239 @@ public final class BundleWriter {
             return best;
         }
 
-        private static String runPs(String expr) {
-            try {
-                ProcessBuilder pb = new ProcessBuilder(
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-Command",
-                    expr);
-                pb.redirectErrorStream(true);
-                Process process = pb.start();
-                String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-                boolean finished = process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
-                if (!finished) {
-                    process.destroyForcibly();
-                }
-                return out.isBlank() ? "unknown" : out;
-            } catch (Exception e) {
-                return "unknown";
-            }
-        }
     }
 
     private record GpuAdapter(String name, String driverVersion, long vramMb) {
+    }
+
+    static final class DeviceDetails {
+        private final List<DetailedGpuAdapter> adapters;
+        private final List<DisplayDevice> displays;
+        private final Map<String, Integer> deviceCountsByClass;
+        private final List<CompactDevice> inputDevices;
+        private final List<CompactDevice> audioDevices;
+        private final PowerPlan powerPlan;
+        private final List<GpuPreference> gpuPreferences;
+        private final GraphicsSettings settings;
+        private final List<OverlayProcess> overlayProcesses;
+
+        private DeviceDetails(
+            List<DetailedGpuAdapter> adapters,
+            List<DisplayDevice> displays,
+            Map<String, Integer> deviceCountsByClass,
+            List<CompactDevice> inputDevices,
+            List<CompactDevice> audioDevices,
+            PowerPlan powerPlan,
+            List<GpuPreference> gpuPreferences,
+            GraphicsSettings settings,
+            List<OverlayProcess> overlayProcesses) {
+            this.adapters = adapters;
+            this.displays = displays;
+            this.deviceCountsByClass = deviceCountsByClass;
+            this.inputDevices = inputDevices;
+            this.audioDevices = audioDevices;
+            this.powerPlan = powerPlan;
+            this.gpuPreferences = gpuPreferences;
+            this.settings = settings;
+            this.overlayProcesses = overlayProcesses;
+        }
+
+        private static DeviceDetails query() {
+            List<DetailedGpuAdapter> adapters = queryDetailedGpuAdapters();
+            List<DisplayDevice> displays = queryDisplays();
+            List<CompactDevice> inputDevices = queryInputDevices();
+            List<CompactDevice> audioDevices = queryAudioDevices();
+            Map<String, Integer> countsByClass = countByClass(inputDevices);
+            PowerPlan powerPlan = parsePowerPlanOutput(runPs("powercfg /GETACTIVESCHEME"));
+            List<GpuPreference> gpuPreferences = queryGpuPreferences();
+            GraphicsSettings settings = queryGraphicsSettings();
+            List<OverlayProcess> overlayProcesses = queryOverlayProcesses();
+            return new DeviceDetails(adapters, displays, countsByClass, inputDevices, audioDevices, powerPlan, gpuPreferences, settings, overlayProcesses);
+        }
+
+        private static List<DetailedGpuAdapter> queryDetailedGpuAdapters() {
+            String rows = runPs("Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,VideoProcessor,AdapterRAM,DriverModel | ConvertTo-Csv -NoTypeInformation");
+            List<DetailedGpuAdapter> out = new ArrayList<>();
+            for (Map<String, String> row : parseNamedCsvRows(rows)) {
+                String name = valueOrUnknown(row.get("Name"));
+                if (name.equals("unknown")) {
+                    continue;
+                }
+                long vramMb = -1L;
+                String rawRam = row.getOrDefault("AdapterRAM", "");
+                if (!rawRam.isBlank()) {
+                    try {
+                        vramMb = Long.parseLong(rawRam) / (1024L * 1024L);
+                    } catch (NumberFormatException ignored) {
+                        vramMb = -1L;
+                    }
+                }
+                out.add(new DetailedGpuAdapter(
+                    name,
+                    valueOrUnknown(row.get("DriverVersion")),
+                    valueOrUnknown(row.get("VideoProcessor")),
+                    valueOrUnknown(row.get("DriverModel")),
+                    vramMb));
+            }
+            out.sort((a, b) -> a.name.compareToIgnoreCase(b.name));
+            return out;
+        }
+
+        private static List<DisplayDevice> queryDisplays() {
+            String rows = runPs("Get-CimInstance Win32_DesktopMonitor | Select-Object Name,ScreenWidth,ScreenHeight | ConvertTo-Csv -NoTypeInformation");
+            LinkedHashMap<String, DisplayDevice> unique = new LinkedHashMap<>();
+            for (Map<String, String> row : parseNamedCsvRows(rows)) {
+                String name = valueOrUnknown(row.get("Name"));
+                Integer widthValue = parseInteger(row.get("ScreenWidth"));
+                Integer heightValue = parseInteger(row.get("ScreenHeight"));
+                int width = widthValue == null ? -1 : widthValue;
+                int height = heightValue == null ? -1 : heightValue;
+                String key = name + "|" + width + "|" + height;
+                unique.putIfAbsent(key, new DisplayDevice(name, width, height));
+            }
+            List<DisplayDevice> out = new ArrayList<>(unique.values());
+            out.sort((a, b) -> a.name.compareToIgnoreCase(b.name));
+            return out;
+        }
+
+        private static List<CompactDevice> queryInputDevices() {
+            String rows = runPs("Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -in 'Mouse','Keyboard','HIDClass','USB','AudioEndpoint' } | Select-Object Name,PNPClass,Manufacturer,Status | ConvertTo-Csv -NoTypeInformation");
+            return parseCompactDevices(rows, true);
+        }
+
+        private static List<CompactDevice> queryAudioDevices() {
+            LinkedHashMap<String, CompactDevice> unique = new LinkedHashMap<>();
+            for (CompactDevice device : parseCompactDevices(
+                runPs("Get-CimInstance Win32_SoundDevice | Select-Object Name,Manufacturer,Status | ConvertTo-Csv -NoTypeInformation"),
+                false)) {
+                unique.putIfAbsent(device.name + "|" + device.manufacturer + "|" + device.status, device);
+            }
+            for (CompactDevice device : parseCompactDevices(
+                runPs("Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match 'audio|headset|speaker|dac' } | Select-Object Name,Manufacturer,Status | ConvertTo-Csv -NoTypeInformation"),
+                false)) {
+                unique.putIfAbsent(device.name + "|" + device.manufacturer + "|" + device.status, device);
+            }
+            List<CompactDevice> out = new ArrayList<>(unique.values());
+            out.sort((a, b) -> a.name.compareToIgnoreCase(b.name));
+            return out;
+        }
+
+        private static List<CompactDevice> parseCompactDevices(String rows, boolean includeClass) {
+            LinkedHashMap<String, CompactDevice> unique = new LinkedHashMap<>();
+            for (Map<String, String> row : parseNamedCsvRows(rows)) {
+                String name = valueOrUnknown(row.get("Name"));
+                if (name.equals("unknown")) {
+                    continue;
+                }
+                String deviceClass = includeClass ? valueOrUnknown(row.get("PNPClass")) : "";
+                String manufacturer = valueOrUnknown(row.get("Manufacturer"));
+                String status = valueOrUnknown(row.get("Status"));
+                CompactDevice device = new CompactDevice(name, deviceClass, manufacturer, status);
+                unique.putIfAbsent(name + "|" + deviceClass + "|" + manufacturer + "|" + status, device);
+            }
+            List<CompactDevice> out = new ArrayList<>(unique.values());
+            out.sort((a, b) -> a.name.compareToIgnoreCase(b.name));
+            return out;
+        }
+
+        private static Map<String, Integer> countByClass(List<CompactDevice> devices) {
+            TreeMap<String, Integer> counts = new TreeMap<>();
+            for (CompactDevice device : devices) {
+                String key = device.deviceClass == null || device.deviceClass.isBlank()
+                    ? "unknown"
+                    : device.deviceClass.toLowerCase(Locale.ROOT);
+                counts.merge(key, 1, Integer::sum);
+            }
+            return counts;
+        }
+
+        private static List<GpuPreference> queryGpuPreferences() {
+            String rows = runPs("$prefs = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\DirectX\\UserGpuPreferences' -ErrorAction SilentlyContinue; "
+                + "if ($null -eq $prefs) { @() } else { "
+                + "$prefs.PSObject.Properties | Where-Object { $_.MemberType -eq 'NoteProperty' } | "
+                + "Select-Object Name,Value | ConvertTo-Csv -NoTypeInformation }");
+            List<GpuPreference> out = new ArrayList<>();
+            for (Map<String, String> row : parseNamedCsvRows(rows)) {
+                String application = valueOrUnknown(row.get("Name"));
+                if (application.equals("unknown")) {
+                    continue;
+                }
+                out.add(new GpuPreference(application, parseGpuPreferenceValue(row.get("Value"))));
+            }
+            out.sort((a, b) -> a.application.compareToIgnoreCase(b.application));
+            return out;
+        }
+
+        private static GraphicsSettings queryGraphicsSettings() {
+            Map<String, String> gameBar = firstRow(runPs("Get-ItemProperty 'HKCU:\\Software\\Microsoft\\GameBar' -ErrorAction SilentlyContinue | Select-Object AutoGameModeEnabled | ConvertTo-Csv -NoTypeInformation"));
+            Map<String, String> gameConfig = firstRow(runPs("Get-ItemProperty 'HKCU:\\System\\GameConfigStore' -ErrorAction SilentlyContinue | Select-Object GameDVR_Enabled,GameDVR_FSEBehaviorMode,VRREnabled | ConvertTo-Csv -NoTypeInformation"));
+            Map<String, String> graphicsDrivers = firstRow(runPs("Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers' -ErrorAction SilentlyContinue | Select-Object TdrLevel,TdrDelay,TdrDdiDelay | ConvertTo-Csv -NoTypeInformation"));
+            Map<String, String> scheduler = firstRow(runPs("Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\\Scheduler' -ErrorAction SilentlyContinue | Select-Object HwSchMode | ConvertTo-Csv -NoTypeInformation"));
+            return new GraphicsSettings(
+                parseBooleanFlag(gameBar.get("AutoGameModeEnabled")),
+                parseBooleanFlag(gameConfig.get("GameDVR_Enabled")),
+                parseInteger(gameConfig.get("GameDVR_FSEBehaviorMode")),
+                parseBooleanFlag(gameConfig.get("VRREnabled")),
+                parseHagsMode(scheduler.get("HwSchMode")),
+                parseInteger(graphicsDrivers.get("TdrLevel")),
+                parseInteger(graphicsDrivers.get("TdrDelay")),
+                parseInteger(graphicsDrivers.get("TdrDdiDelay")));
+        }
+
+        private static List<OverlayProcess> queryOverlayProcesses() {
+            String rows = runPs("Get-Process | Where-Object { $_.ProcessName -match 'rtss|afterburner|obs|discord|overwolf|nvidia|amd|steelseries|razer|logi|ghub|sonar|voicemeeter|nahimic|armoury|icue|nzxt|asus|msi' } | Group-Object ProcessName | Select-Object Name,Count | ConvertTo-Csv -NoTypeInformation");
+            List<OverlayProcess> out = new ArrayList<>();
+            for (Map<String, String> row : parseNamedCsvRows(rows)) {
+                String name = valueOrUnknown(row.get("Name"));
+                if (name.equals("unknown")) {
+                    continue;
+                }
+                Integer count = parseInteger(row.get("Count"));
+                out.add(new OverlayProcess(name, count == null ? 1 : count));
+            }
+            out.sort((a, b) -> a.name.compareToIgnoreCase(b.name));
+            return out;
+        }
+
+        private static Map<String, String> firstRow(String rows) {
+            List<Map<String, String>> parsed = parseNamedCsvRows(rows);
+            return parsed.isEmpty() ? Map.of() : parsed.get(0);
+        }
+
+        private static String valueOrUnknown(String rawValue) {
+            if (rawValue == null || rawValue.isBlank()) {
+                return "unknown";
+            }
+            return rawValue.trim();
+        }
+    }
+
+    private record DetailedGpuAdapter(String name, String driverVersion, String videoProcessor, String driverModel, long vramMb) {
+    }
+
+    private record DisplayDevice(String name, int width, int height) {
+    }
+
+    private record CompactDevice(String name, String deviceClass, String manufacturer, String status) {
+    }
+
+    static record PowerPlan(String guid, String name) {
+    }
+
+    private record GpuPreference(String application, String preference) {
+    }
+
+    private record GraphicsSettings(
+        Boolean autoGameModeEnabled,
+        Boolean gameDvrEnabled,
+        Integer gameDvrFseBehaviorMode,
+        Boolean vrrEnabled,
+        String hagsMode,
+        Integer tdrLevel,
+        Integer tdrDelaySeconds,
+        Integer tdrDdiDelaySeconds) {
+    }
+
+    private record OverlayProcess(String name, int count) {
     }
 }

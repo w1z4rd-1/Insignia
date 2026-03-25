@@ -10,6 +10,7 @@ import net.infiniteimperm.fabric.tagger.TaggerMod;
 import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -18,6 +19,10 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public final class JfrController {
     private static final AtomicReference<JfrController> ACTIVE = new AtomicReference<>();
+    static final long UPLOAD_BATCH_BYTES_THRESHOLD = 65_536L;
+    static final long UPLOAD_BATCH_DURATION_THRESHOLD_NS = 500_000L;
+    static final int UPLOAD_BATCH_COUNT_THRESHOLD = 32;
+    static final long SHADER_BATCH_DURATION_THRESHOLD_NS = 1_000_000L;
     private static final int PHASE_WORLD = 1;
     private static final int PHASE_GUI = 5;
     private static final int PHASE_POST = 6;
@@ -40,6 +45,16 @@ public final class JfrController {
     private final AtomicLong bufferUploadBatchCount = new AtomicLong(0);
     private final AtomicLong textureUploadBatchCount = new AtomicLong(0);
     private final AtomicLong shaderBatchCount = new AtomicLong(0);
+    private final AtomicLong vanillaChunkHookSeen = new AtomicLong(0);
+    private final AtomicLong sodiumChunkHookSeen = new AtomicLong(0);
+    private final AtomicLong vanillaBufferHookSeen = new AtomicLong(0);
+    private final AtomicLong sodiumBufferHookSeen = new AtomicLong(0);
+    private final AtomicLong textureHookSeen = new AtomicLong(0);
+    private final AtomicLong vanillaShaderHookSeen = new AtomicLong(0);
+    private final AtomicLong sodiumShaderHookSeen = new AtomicLong(0);
+    private final AtomicLong textureNoFrameDrops = new AtomicLong(0);
+    private final AtomicLong shaderNoFrameDrops = new AtomicLong(0);
+    private final AtomicLong shaderBelowThresholdDrops = new AtomicLong(0);
     private volatile long activeFrameId;
     private volatile long activeFrameStartNs;
     private volatile long activeFrameStartWallMs;
@@ -54,11 +69,24 @@ public final class JfrController {
     private volatile int bufferUploadCount;
     private volatile long bufferUploadBytes;
     private volatile long bufferUploadDurationNs;
+    private volatile int pendingBufferUploadCount;
+    private volatile long pendingBufferUploadBytes;
+    private volatile long pendingBufferUploadDurationNs;
     private volatile int textureUploadCount;
     private volatile long textureUploadBytes;
     private volatile long textureUploadDurationNs;
+    private volatile int pendingTextureUploadCount;
+    private volatile long pendingTextureUploadBytes;
+    private volatile long pendingTextureUploadDurationNs;
+    private volatile int pendingOffFrameTextureUploadCount;
+    private volatile long pendingOffFrameTextureUploadBytes;
+    private volatile long pendingOffFrameTextureUploadDurationNs;
     private volatile int shaderCompileCount;
     private volatile long shaderCompileDurationNs;
+    private volatile int pendingShaderCompileCount;
+    private volatile long pendingShaderCompileDurationNs;
+    private volatile int pendingOffFrameShaderCompileCount;
+    private volatile long pendingOffFrameShaderCompileDurationNs;
     private Recording recording;
     private Thread worker;
     private Instant startWall;
@@ -72,17 +100,17 @@ public final class JfrController {
         Files.createDirectories(logPath.getParent());
         this.recording = new Recording();
         recording.setToDisk(true);
-        enableIfPresent("jdk.ExecutionSample");
-        enableIfPresent("jdk.ObjectAllocationInNewTLAB");
-        enableIfPresent("jdk.ObjectAllocationOutsideTLAB");
-        enableIfPresent("jdk.JavaMonitorEnter");
-        enableIfPresent("jdk.ThreadPark");
-        enableIfPresent("jdk.GarbageCollection");
-        enableIfPresent("jdk.GCPhasePause");
-        enableIfPresent("jdk.ThreadCPULoad");
-        enableIfPresent("jdk.ThreadStart");
-        enableIfPresent("jdk.ThreadEnd");
-        enableIfPresent("jdk.JavaErrorThrow");
+        enableExecutionSample();
+        enableIfPresent("jdk.ObjectAllocationInNewTLAB", true);
+        enableIfPresent("jdk.ObjectAllocationOutsideTLAB", true);
+        enableIfPresent("jdk.JavaMonitorEnter", true);
+        enableIfPresent("jdk.ThreadPark", true);
+        enableIfPresent("jdk.GarbageCollection", false);
+        enableIfPresent("jdk.GCPhasePause", false);
+        enableIfPresent("jdk.ThreadCPULoad", false);
+        enableIfPresent("jdk.ThreadStart", false);
+        enableIfPresent("jdk.ThreadEnd", false);
+        enableIfPresent("jdk.JavaErrorThrow", true);
 
         recording.start();
         startWall = Instant.now();
@@ -94,7 +122,10 @@ public final class JfrController {
         worker.start();
         logLine("[JFR] recording started at " + startWall);
         logLine("[JFR] custom instrumentation enabled: HudFrameStart/HudFrameEnd/FramePhase/FrameSummary/WorldTransition/UserStutterMark/ResourceReload/ChunkBuildBatch/BufferUploadBatch/TextureUploadBatch/ShaderCompileBatch");
-        logLine("[JFR] thresholds: buffer_or_texture_upload bytes>=65536 or durationNs>=500000, shader_compile durationNs>=1000000");
+        logLine("[JFR] thresholds: upload batch flush when bytes>=" + UPLOAD_BATCH_BYTES_THRESHOLD
+            + " or durationNs>=" + UPLOAD_BATCH_DURATION_THRESHOLD_NS
+            + " or uploadCount>=" + UPLOAD_BATCH_COUNT_THRESHOLD
+            + ", shader_compile durationNs>=" + SHADER_BATCH_DURATION_THRESHOLD_NS);
     }
 
     public void stopAndDump(Path outputJfr) throws Exception {
@@ -103,6 +134,7 @@ public final class JfrController {
         if (worker != null) {
             worker.join(1500);
         }
+        flushPendingOffFrameBatches();
         drainBatch();
         endWall = Instant.now();
         logLine("[JFR] recording stopping at " + endWall);
@@ -121,6 +153,16 @@ public final class JfrController {
             + " bufferUploadBatch=" + bufferUploadBatchCount.get()
             + " textureUploadBatch=" + textureUploadBatchCount.get()
             + " shaderBatch=" + shaderBatchCount.get());
+        logLine("[JFR] hook_seen_counts vanillaChunk=" + vanillaChunkHookSeen.get()
+            + " sodiumChunk=" + sodiumChunkHookSeen.get()
+            + " vanillaBuffer=" + vanillaBufferHookSeen.get()
+            + " sodiumBuffer=" + sodiumBufferHookSeen.get()
+            + " texture=" + textureHookSeen.get()
+            + " vanillaShader=" + vanillaShaderHookSeen.get()
+            + " sodiumShader=" + sodiumShaderHookSeen.get());
+        logLine("[JFR] offframe_activity texture=" + textureNoFrameDrops.get()
+            + " shader=" + shaderNoFrameDrops.get()
+            + " subthreshold_shader_updates=" + shaderBelowThresholdDrops.get());
     }
 
     public Instant startWall() {
@@ -166,10 +208,24 @@ public final class JfrController {
         }
     }
 
-    private void enableIfPresent(String eventName) {
+    private void enableExecutionSample() {
         try {
-            recording.enable(eventName);
-            logLine("[JFR] enabled event: " + eventName);
+            recording.enable("jdk.ExecutionSample")
+                .withPeriod(Duration.ofMillis(10))
+                .withStackTrace();
+            logLine("[JFR] enabled event: jdk.ExecutionSample period=10 ms stacktrace=true");
+        } catch (Throwable t) {
+            logLine("[JFR] event not available: jdk.ExecutionSample (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    private void enableIfPresent(String eventName, boolean withStackTrace) {
+        try {
+            var settings = recording.enable(eventName);
+            if (withStackTrace) {
+                settings.withStackTrace();
+            }
+            logLine("[JFR] enabled event: " + eventName + (withStackTrace ? " stacktrace=true" : ""));
         } catch (Throwable t) {
             logLine("[JFR] event not available: " + eventName + " (" + t.getClass().getSimpleName() + ")");
         }
@@ -208,11 +264,19 @@ public final class JfrController {
         controller.bufferUploadCount = 0;
         controller.bufferUploadBytes = 0L;
         controller.bufferUploadDurationNs = 0L;
+        controller.pendingBufferUploadCount = 0;
+        controller.pendingBufferUploadBytes = 0L;
+        controller.pendingBufferUploadDurationNs = 0L;
         controller.textureUploadCount = 0;
         controller.textureUploadBytes = 0L;
         controller.textureUploadDurationNs = 0L;
+        controller.pendingTextureUploadCount = 0;
+        controller.pendingTextureUploadBytes = 0L;
+        controller.pendingTextureUploadDurationNs = 0L;
         controller.shaderCompileCount = 0;
         controller.shaderCompileDurationNs = 0L;
+        controller.pendingShaderCompileCount = 0;
+        controller.pendingShaderCompileDurationNs = 0L;
         controller.worldPhaseStartNs = 0L;
         controller.hudPhaseStartNs = nowNs;
 
@@ -360,6 +424,14 @@ public final class JfrController {
         controller.chunkBatchCount.incrementAndGet();
     }
 
+    public static void onVanillaChunkHookSeen() {
+        markHookSeen(HookType.VANILLA_CHUNK);
+    }
+
+    public static void onSodiumChunkHookSeen() {
+        markHookSeen(HookType.SODIUM_CHUNK);
+    }
+
     public static void onBufferUploadBatch(int uploadCount, long bytes, long durationNs) {
         JfrController controller = ACTIVE.get();
         if (controller == null || !controller.running.get() || controller.activeFrameId == 0L) {
@@ -368,68 +440,160 @@ public final class JfrController {
         int safeCount = Math.max(0, uploadCount);
         long safeBytes = Math.max(0L, bytes);
         long safeDur = Math.max(0L, durationNs);
-        if (safeBytes < 65_536L && safeDur < 500_000L) {
+        if (safeCount <= 0 && safeBytes <= 0L && safeDur <= 0L) {
             return;
         }
         controller.bufferUploadCount += safeCount;
         controller.bufferUploadBytes += safeBytes;
         controller.bufferUploadDurationNs += safeDur;
+        controller.pendingBufferUploadCount += safeCount;
+        controller.pendingBufferUploadBytes += safeBytes;
+        controller.pendingBufferUploadDurationNs += safeDur;
+        if (!shouldFlushUploadBatch(
+            controller.pendingBufferUploadCount,
+            controller.pendingBufferUploadBytes,
+            controller.pendingBufferUploadDurationNs)) {
+            return;
+        }
+        controller.emitBufferUploadBatch(
+            controller.pendingBufferUploadCount,
+            controller.pendingBufferUploadBytes,
+            controller.pendingBufferUploadDurationNs);
+    }
+
+    private void emitBufferUploadBatch(int uploadCount, long bytes, long durationNs) {
         BufferUploadBatchEvent event = new BufferUploadBatchEvent();
-        event.frameId = controller.activeFrameId;
+        event.frameId = activeFrameId;
         event.nanoTime = System.nanoTime();
         event.wallMillis = System.currentTimeMillis();
-        event.uploadCount = safeCount;
-        event.bytes = safeBytes;
-        event.durationNs = safeDur;
+        event.uploadCount = uploadCount;
+        event.bytes = bytes;
+        event.durationNs = durationNs;
         event.commit();
-        controller.bufferUploadBatchCount.incrementAndGet();
+        bufferUploadBatchCount.incrementAndGet();
+        pendingBufferUploadCount = 0;
+        pendingBufferUploadBytes = 0L;
+        pendingBufferUploadDurationNs = 0L;
+    }
+
+    public static void onVanillaBufferHookSeen() {
+        markHookSeen(HookType.VANILLA_BUFFER);
+    }
+
+    public static void onSodiumBufferHookSeen() {
+        markHookSeen(HookType.SODIUM_BUFFER);
     }
 
     public static void onTextureUploadBatch(int uploadCount, long bytes, long durationNs) {
+        markHookSeen(HookType.TEXTURE);
         JfrController controller = ACTIVE.get();
-        if (controller == null || !controller.running.get() || controller.activeFrameId == 0L) {
+        if (controller == null || !controller.running.get()) {
             return;
         }
         int safeCount = Math.max(0, uploadCount);
         long safeBytes = Math.max(0L, bytes);
         long safeDur = Math.max(0L, durationNs);
-        if (safeBytes < 65_536L && safeDur < 500_000L) {
+        if (safeCount <= 0 && safeBytes <= 0L && safeDur <= 0L) {
+            return;
+        }
+        if (controller.activeFrameId == 0L) {
+            controller.textureNoFrameDrops.incrementAndGet();
+            controller.pendingOffFrameTextureUploadCount += safeCount;
+            controller.pendingOffFrameTextureUploadBytes += safeBytes;
+            controller.pendingOffFrameTextureUploadDurationNs += safeDur;
+            if (shouldFlushUploadBatch(
+                controller.pendingOffFrameTextureUploadCount,
+                controller.pendingOffFrameTextureUploadBytes,
+                controller.pendingOffFrameTextureUploadDurationNs)) {
+                controller.emitTextureUploadBatch(
+                    0L,
+                    controller.pendingOffFrameTextureUploadCount,
+                    controller.pendingOffFrameTextureUploadBytes,
+                    controller.pendingOffFrameTextureUploadDurationNs);
+            }
             return;
         }
         controller.textureUploadCount += safeCount;
         controller.textureUploadBytes += safeBytes;
         controller.textureUploadDurationNs += safeDur;
+        controller.pendingTextureUploadCount += safeCount;
+        controller.pendingTextureUploadBytes += safeBytes;
+        controller.pendingTextureUploadDurationNs += safeDur;
+        if (!shouldFlushUploadBatch(
+            controller.pendingTextureUploadCount,
+            controller.pendingTextureUploadBytes,
+            controller.pendingTextureUploadDurationNs)) {
+            return;
+        }
+        controller.emitTextureUploadBatch(
+            controller.activeFrameId,
+            controller.pendingTextureUploadCount,
+            controller.pendingTextureUploadBytes,
+            controller.pendingTextureUploadDurationNs);
+    }
+
+    private void emitTextureUploadBatch(long frameId, int uploadCount, long bytes, long durationNs) {
         TextureUploadBatchEvent event = new TextureUploadBatchEvent();
-        event.frameId = controller.activeFrameId;
+        event.frameId = frameId;
         event.nanoTime = System.nanoTime();
         event.wallMillis = System.currentTimeMillis();
-        event.uploadCount = safeCount;
-        event.bytes = safeBytes;
-        event.durationNs = safeDur;
+        event.uploadCount = uploadCount;
+        event.bytes = bytes;
+        event.durationNs = durationNs;
         event.commit();
-        controller.textureUploadBatchCount.incrementAndGet();
+        textureUploadBatchCount.incrementAndGet();
+        if (frameId == 0L) {
+            pendingOffFrameTextureUploadCount = 0;
+            pendingOffFrameTextureUploadBytes = 0L;
+            pendingOffFrameTextureUploadDurationNs = 0L;
+        } else {
+            pendingTextureUploadCount = 0;
+            pendingTextureUploadBytes = 0L;
+            pendingTextureUploadDurationNs = 0L;
+        }
     }
 
     public static void onShaderCompileBatch(int compileCount, long durationNs) {
         JfrController controller = ACTIVE.get();
-        if (controller == null || !controller.running.get() || controller.activeFrameId == 0L) {
+        if (controller == null || !controller.running.get()) {
             return;
         }
         int safeCount = Math.max(0, compileCount);
         long safeDur = Math.max(0L, durationNs);
-        if (safeCount <= 0 || safeDur < 1_000_000L) {
+        if (safeCount <= 0) {
+            return;
+        }
+        if (controller.activeFrameId == 0L) {
+            controller.shaderNoFrameDrops.incrementAndGet();
+            controller.pendingOffFrameShaderCompileCount += safeCount;
+            controller.pendingOffFrameShaderCompileDurationNs += safeDur;
+            if (shouldFlushShaderBatch(
+                controller.pendingOffFrameShaderCompileCount,
+                controller.pendingOffFrameShaderCompileDurationNs)) {
+                controller.emitShaderCompileBatch(
+                    0L,
+                    controller.pendingOffFrameShaderCompileCount,
+                    controller.pendingOffFrameShaderCompileDurationNs);
+            }
             return;
         }
         controller.shaderCompileCount += safeCount;
         controller.shaderCompileDurationNs += safeDur;
-        ShaderCompileBatchEvent event = new ShaderCompileBatchEvent();
-        event.frameId = controller.activeFrameId;
-        event.nanoTime = System.nanoTime();
-        event.wallMillis = System.currentTimeMillis();
-        event.compileCount = safeCount;
-        event.durationNs = safeDur;
-        event.commit();
-        controller.shaderBatchCount.incrementAndGet();
+        controller.pendingShaderCompileCount += safeCount;
+        controller.pendingShaderCompileDurationNs += safeDur;
+        if (!shouldFlushShaderBatch(controller.pendingShaderCompileCount, controller.pendingShaderCompileDurationNs)) {
+            controller.shaderBelowThresholdDrops.incrementAndGet();
+            return;
+        }
+        controller.emitShaderCompileBatch(controller.activeFrameId, controller.pendingShaderCompileCount, controller.pendingShaderCompileDurationNs);
+    }
+
+    public static void onVanillaShaderHookSeen() {
+        markHookSeen(HookType.VANILLA_SHADER);
+    }
+
+    public static void onSodiumShaderHookSeen() {
+        markHookSeen(HookType.SODIUM_SHADER);
     }
 
     public static int transitionJoin() {
@@ -466,6 +630,15 @@ public final class JfrController {
     private void flushFrameSummary(long nowNs, long nowMs) {
         if (activeFrameId == 0L) {
             return;
+        }
+        if (pendingBufferUploadCount > 0 || pendingBufferUploadBytes > 0L || pendingBufferUploadDurationNs > 0L) {
+            emitBufferUploadBatch(pendingBufferUploadCount, pendingBufferUploadBytes, pendingBufferUploadDurationNs);
+        }
+        if (pendingTextureUploadCount > 0 || pendingTextureUploadBytes > 0L || pendingTextureUploadDurationNs > 0L) {
+            emitTextureUploadBatch(activeFrameId, pendingTextureUploadCount, pendingTextureUploadBytes, pendingTextureUploadDurationNs);
+        }
+        if (pendingShaderCompileCount > 0 || pendingShaderCompileDurationNs > 0L) {
+            emitShaderCompileBatch(activeFrameId, pendingShaderCompileCount, pendingShaderCompileDurationNs);
         }
         long totalFrameNs = Math.max(0L, nowNs - activeFrameStartNs);
         FrameSummaryEvent event = new FrameSummaryEvent();
@@ -505,14 +678,95 @@ public final class JfrController {
         bufferUploadCount = 0;
         bufferUploadBytes = 0L;
         bufferUploadDurationNs = 0L;
+        pendingBufferUploadCount = 0;
+        pendingBufferUploadBytes = 0L;
+        pendingBufferUploadDurationNs = 0L;
         textureUploadCount = 0;
         textureUploadBytes = 0L;
         textureUploadDurationNs = 0L;
+        pendingTextureUploadCount = 0;
+        pendingTextureUploadBytes = 0L;
+        pendingTextureUploadDurationNs = 0L;
         shaderCompileCount = 0;
         shaderCompileDurationNs = 0L;
+        pendingShaderCompileCount = 0;
+        pendingShaderCompileDurationNs = 0L;
+    }
+
+    static boolean shouldFlushUploadBatch(int uploadCount, long bytes, long durationNs) {
+        return uploadCount >= UPLOAD_BATCH_COUNT_THRESHOLD
+            || bytes >= UPLOAD_BATCH_BYTES_THRESHOLD
+            || durationNs >= UPLOAD_BATCH_DURATION_THRESHOLD_NS;
+    }
+
+    static boolean shouldFlushShaderBatch(int compileCount, long durationNs) {
+        return compileCount > 0 && durationNs >= SHADER_BATCH_DURATION_THRESHOLD_NS;
+    }
+
+    private void emitShaderCompileBatch(long frameId, int compileCount, long durationNs) {
+        ShaderCompileBatchEvent event = new ShaderCompileBatchEvent();
+        event.frameId = frameId;
+        event.nanoTime = System.nanoTime();
+        event.wallMillis = System.currentTimeMillis();
+        event.compileCount = compileCount;
+        event.durationNs = durationNs;
+        event.commit();
+        shaderBatchCount.incrementAndGet();
+        if (frameId == 0L) {
+            pendingOffFrameShaderCompileCount = 0;
+            pendingOffFrameShaderCompileDurationNs = 0L;
+        } else {
+            pendingShaderCompileCount = 0;
+            pendingShaderCompileDurationNs = 0L;
+        }
+    }
+
+    private void flushPendingOffFrameBatches() {
+        if (pendingOffFrameTextureUploadCount > 0 || pendingOffFrameTextureUploadBytes > 0L || pendingOffFrameTextureUploadDurationNs > 0L) {
+            emitTextureUploadBatch(0L, pendingOffFrameTextureUploadCount, pendingOffFrameTextureUploadBytes, pendingOffFrameTextureUploadDurationNs);
+        }
+        if (pendingOffFrameShaderCompileCount > 0 || pendingOffFrameShaderCompileDurationNs > 0L) {
+            emitShaderCompileBatch(0L, pendingOffFrameShaderCompileCount, pendingOffFrameShaderCompileDurationNs);
+        }
     }
 
     private record FrameBoundary(long frameIndex, long nanoTime, long wallMillis) {
+    }
+
+    private static void markHookSeen(HookType type) {
+        JfrController controller = ACTIVE.get();
+        if (controller == null || !controller.running.get()) {
+            return;
+        }
+        AtomicLong counter = switch (type) {
+            case VANILLA_CHUNK -> controller.vanillaChunkHookSeen;
+            case SODIUM_CHUNK -> controller.sodiumChunkHookSeen;
+            case VANILLA_BUFFER -> controller.vanillaBufferHookSeen;
+            case SODIUM_BUFFER -> controller.sodiumBufferHookSeen;
+            case TEXTURE -> controller.textureHookSeen;
+            case VANILLA_SHADER -> controller.vanillaShaderHookSeen;
+            case SODIUM_SHADER -> controller.sodiumShaderHookSeen;
+        };
+        long seen = counter.incrementAndGet();
+        if (seen == 1L) {
+            controller.logLine("[JFR] hook first_seen: " + type.logName);
+        }
+    }
+
+    private enum HookType {
+        VANILLA_CHUNK("vanilla_chunk"),
+        SODIUM_CHUNK("sodium_chunk"),
+        VANILLA_BUFFER("vanilla_buffer"),
+        SODIUM_BUFFER("sodium_buffer"),
+        TEXTURE("texture"),
+        VANILLA_SHADER("vanilla_shader"),
+        SODIUM_SHADER("sodium_shader");
+
+        private final String logName;
+
+        HookType(String logName) {
+            this.logName = logName;
+        }
     }
 
     @Name("insignia.FrameBoundary")
